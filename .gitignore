@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.log
+osm_data.xml
+circuit_trails_loom.json
