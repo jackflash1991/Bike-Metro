@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from xml.etree import ElementTree as ET
+import math
 from shapely.geometry import LineString, Point
 from shapely.ops import unary_union
 from datetime import datetime
@@ -110,46 +111,60 @@ class OSMTrailDownloader:
             raise
     
     def parse_osm_xml(self, file_path=None):
-        """Parse OSM XML data and extract trail information."""
+        """Parse OSM XML data and extract trail information.
+
+        Handles both 'out body geom;' responses (where <nd> elements carry
+        inline lat/lon attributes) and 'out body; >; out skel;' responses
+        (where standalone <node> elements are present).
+        """
         if file_path is None:
             file_path = self.data_file
-        
+
         if not os.path.exists(file_path):
             logger.error(f"File not found: {file_path}")
             return False
-        
+
         try:
             logger.info(f"Parsing OSM data from {file_path}")
             tree = ET.parse(file_path)
             root = tree.getroot()
-            
+
             self.trails = []
+
+            # Build lookup from standalone <node> elements (used when the
+            # query returns nodes separately, e.g. with 'out body; >;').
             node_dict = {}
-            
             for node in root.findall('node'):
                 node_id = node.get('id')
-                lat = float(node.get('lat'))
-                lon = float(node.get('lon'))
-                node_dict[node_id] = (lat, lon)
-            
+                lat = node.get('lat')
+                lon = node.get('lon')
+                if lat is not None and lon is not None:
+                    node_dict[node_id] = (float(lat), float(lon))
+
             way_count = 0
+            unnamed_count = 0
             for way in root.findall('way'):
                 way_id = way.get('id')
                 tags = {tag.get('k'): tag.get('v') for tag in way.findall('tag')}
-                
+
                 if 'name' not in tags:
-                    continue
-                
-                nd_refs = [nd.get('ref') for nd in way.findall('nd')]
+                    unnamed_count += 1
+
+                # Extract coordinates: prefer inline lat/lon on <nd> elements
+                # (returned by 'out body geom;'), fall back to node_dict.
                 coords = []
-                for nd_ref in nd_refs:
-                    if nd_ref in node_dict:
-                        coords.append(node_dict[nd_ref])
-                
+                for nd in way.findall('nd'):
+                    lat = nd.get('lat')
+                    lon = nd.get('lon')
+                    if lat is not None and lon is not None:
+                        coords.append((float(lat), float(lon)))
+                    elif nd.get('ref') in node_dict:
+                        coords.append(node_dict[nd.get('ref')])
+
                 if len(coords) > 1:
                     trail = {
                         'id': way_id,
-                        'name': tags.get('name'),
+                        'name': tags.get('name', f'Unnamed trail {way_id}'),
                         'type': tags.get('highway', tags.get('tourism', 'unknown')),
                         'difficulty': tags.get('difficulty', 'unknown'),
                         'coordinates': coords,
@@ -157,10 +172,15 @@ class OSMTrailDownloader:
                     }
                     self.trails.append(trail)
                     way_count += 1
-            
+
+            if unnamed_count > 0:
+                logger.warning(
+                    f"{unnamed_count} trails had no name and were labelled "
+                    f"'Unnamed trail <id>'"
+                )
             logger.info(f"Parsed {way_count} trails from OSM data")
             return True
-            
+
         except ET.ParseError as e:
             logger.error(f"Error parsing XML: {e}")
             return False
@@ -230,31 +250,48 @@ class OSMTrailDownloader:
             logger.error(f"Unexpected error building LOOM JSON: {e}")
             return False
     
+    @staticmethod
+    def _haversine_km(lat1, lon1, lat2, lon2):
+        """Return the great-circle distance in km between two points."""
+        R = 6371.0  # Earth radius in km
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) ** 2 +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+             math.sin(dlon / 2) ** 2)
+        return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    def _trail_length_km(self, trail):
+        """Compute the length of a trail in kilometres."""
+        coords = trail['coordinates']
+        return sum(
+            self._haversine_km(coords[i][0], coords[i][1],
+                               coords[i + 1][0], coords[i + 1][1])
+            for i in range(len(coords) - 1)
+        )
+
     def get_statistics(self):
         """Return statistics about downloaded trails."""
         if not self.trails:
             return {}
-        
+
         trail_types = {}
         difficulties = {}
-        
+
         for trail in self.trails:
             trail_type = trail['type']
             difficulty = trail['difficulty']
-            
+
             trail_types[trail_type] = trail_types.get(trail_type, 0) + 1
             difficulties[difficulty] = difficulties.get(difficulty, 0) + 1
-        
-        total_length = sum(
-            LineString(trail['coordinates']).length 
-            for trail in self.trails
-        )
-        
+
+        total_length_km = sum(self._trail_length_km(t) for t in self.trails)
+
         return {
             'total_trails': len(self.trails),
             'trail_types': trail_types,
             'difficulties': difficulties,
-            'total_length_degrees': total_length
+            'total_length_km': round(total_length_km, 2)
         }
 
 def main():
