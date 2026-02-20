@@ -217,9 +217,15 @@ class OSMTrailDownloader:
                 }
                 loom_data['features'].append(feature)
             
+            validation_errors = self.validate_loom_json(loom_data)
+            if validation_errors:
+                for err in validation_errors:
+                    logger.error(f"Validation error: {err}")
+                return False
+
             with open(output_file, 'w') as f:
                 json.dump(loom_data, f, indent=2)
-            
+
             logger.info(f"LOOM JSON saved to {output_file}")
             return True
             
@@ -230,6 +236,67 @@ class OSMTrailDownloader:
             logger.error(f"Unexpected error building LOOM JSON: {e}")
             return False
     
+    def validate_loom_json(self, data):
+        """Validate LOOM JSON output against GeoJSON FeatureCollection schema.
+
+        Returns a list of validation error strings, empty if valid.
+        """
+        errors = []
+
+        if not isinstance(data, dict):
+            return ["Root element must be a JSON object"]
+
+        if data.get("type") != "FeatureCollection":
+            errors.append("Root 'type' must be 'FeatureCollection'")
+
+        if "features" not in data:
+            errors.append("Missing 'features' array")
+            return errors
+
+        if not isinstance(data["features"], list):
+            errors.append("'features' must be an array")
+            return errors
+
+        for i, feature in enumerate(data["features"]):
+            prefix = f"features[{i}]"
+
+            if not isinstance(feature, dict):
+                errors.append(f"{prefix}: must be a JSON object")
+                continue
+
+            if feature.get("type") != "Feature":
+                errors.append(f"{prefix}: 'type' must be 'Feature'")
+
+            geom = feature.get("geometry")
+            if not isinstance(geom, dict):
+                errors.append(f"{prefix}: missing or invalid 'geometry'")
+            else:
+                if geom.get("type") != "LineString":
+                    errors.append(f"{prefix}.geometry: 'type' must be 'LineString'")
+                coords = geom.get("coordinates")
+                if not isinstance(coords, list) or len(coords) < 2:
+                    errors.append(f"{prefix}.geometry: 'coordinates' must have at least 2 points")
+                elif coords:
+                    for j, coord in enumerate(coords):
+                        if not isinstance(coord, list) or len(coord) != 2:
+                            errors.append(f"{prefix}.geometry.coordinates[{j}]: must be [lon, lat]")
+                            break
+                        lon, lat = coord
+                        if not (-180 <= lon <= 180):
+                            errors.append(f"{prefix}.geometry.coordinates[{j}]: lon {lon} out of range")
+                        if not (-90 <= lat <= 90):
+                            errors.append(f"{prefix}.geometry.coordinates[{j}]: lat {lat} out of range")
+
+            props = feature.get("properties")
+            if not isinstance(props, dict):
+                errors.append(f"{prefix}: missing or invalid 'properties'")
+            else:
+                for field in ("id", "name", "type"):
+                    if field not in props:
+                        errors.append(f"{prefix}.properties: missing required field '{field}'")
+
+        return errors
+
     def get_statistics(self):
         """Return statistics about downloaded trails."""
         if not self.trails:
