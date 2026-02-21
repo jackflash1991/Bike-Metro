@@ -1,0 +1,6 @@
+# Output files
+osm_data.xml
+circuit_trails_loom.json
+
+# Logs
+*.log
