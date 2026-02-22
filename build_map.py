@@ -27,12 +27,13 @@ import json
 import math
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from config import (
-    BBOX, OVERPASS_URL,
+    BBOX, OVERPASS_URL, OVERPASS_TIMEOUT,
     EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST,
     LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
     CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
@@ -47,11 +48,34 @@ def log(tag: str, msg: str) -> None:
     print(f"[{tag}] {msg}", flush=True)
 
 
+def check_binaries(need_rail: bool) -> None:
+    """Warn early if required loom binaries are missing from PATH or repo root."""
+    required = ["loom", "topo", "transitmap"]
+    if need_rail:
+        required.append("gtfs2graph")
+
+    missing = []
+    for name in required:
+        local = Path(f"./{name}")
+        on_path = shutil.which(name)
+        if not local.exists() and not on_path:
+            missing.append(name)
+
+    if missing:
+        print(
+            f"[setup] WARNING: missing binaries: {', '.join(missing)}\n"
+            f"[setup] Download the loom tools for your platform from:\n"
+            f"[setup]   https://github.com/ad-freiburg/loom/releases\n"
+            f"[setup] Place them in this directory (or add to PATH) before running.",
+            flush=True,
+        )
+
+
 def overpass_query(query: str) -> list:
     """POST a query to Overpass and return the elements list."""
     data = urllib.parse.urlencode({"data": query}).encode("utf-8")
     req = urllib.request.Request(OVERPASS_URL, data=data)
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 30) as resp:
         result = json.loads(resp.read().decode("utf-8"))
     return result["elements"]
 
@@ -72,9 +96,10 @@ def detect_output_dir(cli_out: str | None) -> Path | None:
     # WSL
     wsl_base = Path("/mnt/c/Users")
     if wsl_base.exists():
-        candidates = sorted(wsl_base.iterdir())
-        if candidates:
-            dl = candidates[0] / "Downloads"
+        win_user = os.environ.get("USER") or os.environ.get("USERNAME")
+        candidate = wsl_base / win_user if win_user else None
+        if candidate and candidate.exists():
+            dl = candidate / "Downloads"
             if dl.exists():
                 return dl
 
@@ -124,7 +149,7 @@ def filter_routes(data: dict) -> dict:
     for feat in data["features"]:
         props = feat.get("properties", {})
         if "lines" in props:
-            lines = [l for l in props["lines"] if l.get("label") not in EXCLUDE_ROUTES]
+            lines = [line for line in props["lines"] if line.get("label") not in EXCLUDE_ROUTES]
             if not lines:
                 removed += 1
                 continue
@@ -259,7 +284,7 @@ def merge_and_render(trails: dict, rail: dict, out_dir: Path | None) -> None:
 
     if out_dir:
         dest = out_dir / OUTPUT_SVG
-        subprocess.run(["cp", OUTPUT_SVG, str(dest)])
+        shutil.copy(OUTPUT_SVG, dest)
         log("done", f"SVG copied to {dest}")
 
         # Try to open in default viewer (best-effort, silent on failure)
@@ -308,6 +333,7 @@ def main() -> None:
     print("=" * 60)
     print("  Circuit Trails + SEPTA Rail Map Builder")
     print("=" * 60)
+    check_binaries(need_rail=not args.no_rail)
 
     # Trail pipeline
     data = fetch_trails(offline=args.offline)
