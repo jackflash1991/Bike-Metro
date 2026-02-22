@@ -1,0 +1,31 @@
+# Generated data files (too large / frequently regenerated)
+circuit_trails.json
+circuit_trails_filtered.json
+combined.json
+combined.svg
+osm_data.xml
+
+# loom binaries (platform-specific, not committed)
+loom
+topo
+octi
+transitmap
+gtfs2graph
+
+# SEPTA GTFS (large, external data)
+google_rail.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+*.log
+
+# Editor
+.DS_Store
+.vscode/
+*.swp

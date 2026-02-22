@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+build_map.py — Circuit Trails + SEPTA Regional Rail transit map pipeline.
+
+Stages:
+  1. Fetch   — query Overpass for bicycle route relations (or load cache)
+  2. Filter  — remove excluded routes (BicyclePA, etc.)
+  3. Enrich  — label graph nodes that match OSM trailhead locations
+  4. Prune   — hide unnamed interior nodes, keep endpoints + trailheads
+  5. Render  — pipe through loom | transitmap to produce an SVG
+
+Usage:
+    python3 build_map.py                  # full rebuild
+    python3 build_map.py --offline        # skip Overpass, use cached JSON
+    python3 build_map.py --no-rail        # trails only, skip SEPTA
+    python3 build_map.py --no-trailheads  # skip trailhead enrichment step
+    python3 build_map.py --out DIR        # write SVG to DIR instead of default
+    python3 build_map.py -h               # show this help
+
+Output:
+    combined.svg — written to the current directory, and optionally copied
+    to an output directory (auto-detected for Windows WSL or macOS Desktop).
+"""
+
+import argparse
+import json
+import math
+import os
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+from config import (
+    BBOX, OVERPASS_URL,
+    EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST,
+    LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
+    CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
+)
+import urllib.request
+import urllib.parse
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
+
+def log(tag: str, msg: str) -> None:
+    print(f"[{tag}] {msg}", flush=True)
+
+
+def overpass_query(query: str) -> list:
+    """POST a query to Overpass and return the elements list."""
+    data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+    req = urllib.request.Request(OVERPASS_URL, data=data)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+    return result["elements"]
+
+
+def detect_output_dir(cli_out: str | None) -> Path | None:
+    """
+    Resolve the best output directory for the SVG:
+      - CLI --out flag wins if provided
+      - Windows WSL: /mnt/c/Users/<user>/Downloads
+      - macOS: ~/Desktop
+      - Otherwise: None (current directory only)
+    """
+    if cli_out:
+        p = Path(cli_out).expanduser()
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # WSL
+    wsl_base = Path("/mnt/c/Users")
+    if wsl_base.exists():
+        candidates = sorted(wsl_base.iterdir())
+        if candidates:
+            dl = candidates[0] / "Downloads"
+            if dl.exists():
+                return dl
+
+    # macOS
+    if platform.system() == "Darwin":
+        return Path.home() / "Desktop"
+
+    return None
+
+
+# ── Stage 1: Fetch ────────────────────────────────────────────────────
+
+def fetch_trails(offline: bool) -> dict:
+    cache = Path(CACHE_FILE)
+
+    if offline:
+        if cache.exists():
+            log("fetch", f"Offline mode — loading {CACHE_FILE}")
+            return json.loads(cache.read_text())
+        else:
+            log("fetch", f"ERROR: --offline requested but {CACHE_FILE} not found")
+            sys.exit(1)
+
+    log("fetch", "Running osm2loom.py...")
+    # osm2loom writes JSON to stdout, progress to stderr
+    result = subprocess.run(
+        [sys.executable, "osm2loom.py"],
+        capture_output=True, text=True
+    )
+    # Forward osm2loom's stderr (progress messages) to our stderr
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        log("fetch", f"osm2loom.py failed (exit {result.returncode})")
+        sys.exit(1)
+
+    data = json.loads(result.stdout)
+    cache.write_text(result.stdout)
+    log("fetch", f"Cached to {CACHE_FILE}")
+    return data
+
+
+# ── Stage 2: Filter excluded routes ──────────────────────────────────
+
+def filter_routes(data: dict) -> dict:
+    kept, removed = [], 0
+    for feat in data["features"]:
+        props = feat.get("properties", {})
+        if "lines" in props:
+            lines = [l for l in props["lines"] if l.get("label") not in EXCLUDE_ROUTES]
+            if not lines:
+                removed += 1
+                continue
+            props["lines"] = lines
+        kept.append(feat)
+    data["features"] = kept
+    log("filter", f"Removed {removed} features belonging to excluded routes")
+    return data
+
+
+# ── Stage 3: Enrich with trailhead labels ────────────────────────────
+
+def add_trailheads(data: dict) -> dict:
+    south, west, north, east = BBOX
+    query = f"""[out:json][timeout:60];
+(
+  node["highway"="trailhead"]({south},{west},{north},{east});
+  node["tourism"="information"]["information"="trailhead"]({south},{west},{north},{east});
+);
+out body;"""
+
+    log("trailheads", "Querying Overpass for trailhead nodes...")
+    try:
+        elements = overpass_query(query)
+    except Exception as exc:
+        log("trailheads", f"Overpass error: {exc} — skipping enrichment")
+        return data
+
+    added = 0
+    for elem in elements:
+        name = elem.get("tags", {}).get("name", "")
+        if not name:
+            continue
+        lon, lat = elem["lon"], elem["lat"]
+
+        best_dist, best_feat = float("inf"), None
+        for feat in data["features"]:
+            if feat["geometry"]["type"] != "Point":
+                continue
+            nlon, nlat = feat["geometry"]["coordinates"]
+            d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
+            if d < best_dist:
+                best_dist, best_feat = d, feat
+
+        if best_dist < TRAILHEAD_MATCH_DIST and best_feat:
+            props = best_feat["properties"]
+            if not props.get("station_label"):
+                props["station_label"] = name
+                props["station_id"] = props["id"]
+                added += 1
+
+    labeled = sum(
+        1 for f in data["features"]
+        if f["geometry"]["type"] == "Point" and f["properties"].get("station_label")
+    )
+    log("trailheads", f"Added {added} trailhead labels (total labeled nodes: {labeled})")
+    return data
+
+
+# ── Stage 4: Prune unnamed interior nodes ────────────────────────────
+
+def filter_nodes(data: dict) -> dict:
+    """Zero-out unnamed non-endpoint nodes so transitmap ignores them."""
+    node_deg: dict[str, int] = {}
+    for feat in data["features"]:
+        if feat["geometry"]["type"] == "LineString":
+            props = feat["properties"]
+            for key in ("from", "to"):
+                nid = props.get(key, "")
+                node_deg[nid] = node_deg.get(nid, 0) + 1
+
+    hidden = 0
+    for feat in data["features"]:
+        if feat["geometry"]["type"] != "Point":
+            continue
+        props = feat["properties"]
+        label = props.get("station_label", "").strip()
+        nid = props.get("id", "")
+        if not label and node_deg.get(nid, 0) != 1:
+            props.update({"station_id": "", "station_label": "", "deg": "0", "deg_in": "0", "deg_out": "0"})
+            hidden += 1
+
+    log("nodes", f"Hidden {hidden} unnamed non-endpoint nodes")
+    return data
+
+
+# ── Stage 5a: Strip colors (let transitmap assign via --random-colors) ─
+
+def strip_colors(data: dict) -> dict:
+    for feat in data["features"]:
+        for line in feat.get("properties", {}).get("lines", []):
+            line["color"] = ""
+    return data
+
+
+# ── Stage 5b: Optional SEPTA rail ────────────────────────────────────
+
+def process_rail() -> dict:
+    log("rail", "Processing SEPTA regional rail (gtfs2graph | topo | loom)...")
+    r1 = subprocess.run("./gtfs2graph -m rail google_rail.zip", shell=True, capture_output=True)
+    r2 = subprocess.run("./topo", shell=True, input=r1.stdout, capture_output=True)
+    r3 = subprocess.run("./loom", shell=True, input=r2.stdout, capture_output=True)
+    if r3.returncode != 0:
+        log("rail", "WARNING: loom failed on rail data — skipping rail")
+        return {"type": "FeatureCollection", "features": []}
+    rail = json.loads(r3.stdout)
+    log("rail", f"{len(rail['features'])} rail features loaded")
+    return rail
+
+
+# ── Stage 6: Merge + render SVG ──────────────────────────────────────
+
+def merge_and_render(trails: dict, rail: dict, out_dir: Path | None) -> None:
+    merged = {
+        "type": "FeatureCollection",
+        "features": trails["features"] + rail["features"],
+    }
+    Path(COMBINED_FILE).write_text(json.dumps(merged))
+    log("merge", f"{len(merged['features'])} total features → {COMBINED_FILE}")
+
+    log("render", "Generating SVG via loom | transitmap...")
+    cmd = (
+        f"cat {COMBINED_FILE} | ./loom | ./transitmap -l --random-colors "
+        f"--line-width={LINE_WIDTH} --line-spacing={LINE_SPACING} "
+        f"--station-label-textsize={STATION_LABEL_SIZE} "
+        f"--line-label-textsize={LINE_LABEL_SIZE} "
+        f"> {OUTPUT_SVG}"
+    )
+    result = subprocess.run(cmd, shell=True)
+    if result.returncode != 0:
+        log("render", "WARNING: transitmap exited non-zero — SVG may be incomplete")
+
+    if out_dir:
+        dest = out_dir / OUTPUT_SVG
+        subprocess.run(["cp", OUTPUT_SVG, str(dest)])
+        log("done", f"SVG copied to {dest}")
+
+        # Try to open in default viewer (best-effort, silent on failure)
+        _try_open(dest)
+    else:
+        log("done", f"SVG saved to {OUTPUT_SVG}")
+
+
+def _try_open(path: Path) -> None:
+    """Open a file in the platform's default viewer, silently ignoring errors."""
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(["open", str(path)], stderr=subprocess.DEVNULL)
+        elif Path("/mnt/c").exists():  # WSL
+            win_path = str(path).replace("/mnt/c/", "C:\\").replace("/", "\\")
+            subprocess.run(f'explorer.exe "{win_path}"', shell=True, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["xdg-open", str(path)], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Circuit Trails + SEPTA Rail Map Builder",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--offline", action="store_true",
+                   help="Skip Overpass fetch, use cached circuit_trails.json")
+    p.add_argument("--no-rail", action="store_true",
+                   help="Skip SEPTA regional rail processing")
+    p.add_argument("--no-trailheads", action="store_true",
+                   help="Skip trailhead label enrichment")
+    p.add_argument("--out", metavar="DIR",
+                   help="Directory to copy the output SVG into")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    out_dir = detect_output_dir(args.out)
+
+    print("=" * 60)
+    print("  Circuit Trails + SEPTA Rail Map Builder")
+    print("=" * 60)
+
+    # Trail pipeline
+    data = fetch_trails(offline=args.offline)
+    data = filter_routes(data)
+    if not args.no_trailheads and not args.offline:
+        data = add_trailheads(data)
+    else:
+        log("trailheads", "Skipped")
+    data = filter_nodes(data)
+    data = strip_colors(data)
+
+    Path(FILTERED_FILE).write_text(json.dumps(data))
+    log("trails", f"Filtered trail data saved to {FILTERED_FILE}")
+
+    # Rail pipeline
+    rail = {"type": "FeatureCollection", "features": []}
+    if not args.no_rail:
+        rail = process_rail()
+    else:
+        log("rail", "Skipped (--no-rail)")
+
+    # Combine and render
+    merge_and_render(data, rail, out_dir)
+
+
+if __name__ == "__main__":
+    main()

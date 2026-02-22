@@ -1,3 +1,5 @@
-requests
-shapely
+# Python stdlib handles HTTP (urllib) so no requests needed.
+# shapely is only needed if you use osm_trails_to_loom.py (now retired).
+# flake8 is a dev linting tool.
+
 flake8
