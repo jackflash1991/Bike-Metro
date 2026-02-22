@@ -126,6 +126,55 @@ def _build_geojson(data: dict) -> dict:
     trailhead_on_routes = trailhead_nodes & route_node_ids
     _log(f"  ({len(trailhead_on_routes)} trailheads are on route ways)")
 
+    # Label the two terminal nodes of each named trail with the trail's name.
+    # A terminal is a node that appears exactly once as a way endpoint (first
+    # or last node of a member way) across the whole route — nodes where two
+    # consecutive ways meet appear twice and are interior junctions.
+    endpoint_label_count = 0
+    for route in routes:
+        way_endpoint_count: dict[int, int] = defaultdict(int)
+        for wid in route["way_refs"]:
+            if wid not in osm_ways:
+                continue
+            nds = [n for n in osm_ways[wid] if n in osm_nodes]
+            if len(nds) < 2:
+                continue
+            way_endpoint_count[nds[0]] += 1
+            way_endpoint_count[nds[-1]] += 1
+        for node_id, count in way_endpoint_count.items():
+            if count == 1 and node_id not in node_names:
+                node_names[node_id] = route["name"]
+                endpoint_label_count += 1
+    _log(f"  Labeled {endpoint_label_count} trail endpoint nodes with route names")
+
+    # Snap trailheads that are within ~50 m (≈0.0005 °) of a route node to
+    # the nearest such node, labeling it with the trailhead's name.  This
+    # catches trailhead markers that don't sit exactly on a route way.
+    SNAP_DEGREES = 0.0005
+    route_node_coords = {
+        nid: osm_nodes[nid] for nid in route_node_ids if nid in osm_nodes
+    }
+    # snap_candidates[route_node_id] = (best_distance, trailhead_name)
+    snap_candidates: dict[int, tuple[float, str]] = {}
+    for th_id in trailhead_nodes:
+        if th_id not in osm_nodes:
+            continue
+        th_name = node_names.get(th_id, "")
+        if not th_name:
+            continue
+        th_lon, th_lat = osm_nodes[th_id]
+        for nid, (nlon, nlat) in route_node_coords.items():
+            dist = ((th_lon - nlon) ** 2 + (th_lat - nlat) ** 2) ** 0.5
+            if dist <= SNAP_DEGREES:
+                if nid not in snap_candidates or dist < snap_candidates[nid][0]:
+                    snap_candidates[nid] = (dist, th_name)
+    nearby_labeled = 0
+    for nid, (_dist, th_name) in snap_candidates.items():
+        if nid not in node_names:
+            node_names[nid] = th_name
+            nearby_labeled += 1
+    _log(f"  Labeled {nearby_labeled} route nodes via nearby trailhead snapping")
+
     # Build edge features, splitting ways at mid-way trailheads
     edge_features = []
     graph_nodes: set[int] = set()
