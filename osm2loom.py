@@ -179,6 +179,7 @@ def _build_geojson(data: dict) -> dict:
     edge_features = []
     graph_nodes: set[int] = set()
     node_degree: dict[int, int] = defaultdict(int)
+    node_routes: dict[int, list[str]] = defaultdict(list)  # node → route names
 
     for route in routes:
         for wid in route["way_refs"]:
@@ -209,6 +210,8 @@ def _build_geojson(data: dict) -> dict:
                 graph_nodes.add(tn)
                 node_degree[fn] += 1
                 node_degree[tn] += 1
+                node_routes[fn].append(route["name"])
+                node_routes[tn].append(route["name"])
                 edge_features.append({
                     "type": "Feature",
                     "geometry": {"type": "LineString", "coordinates": sub_coords},
@@ -229,6 +232,11 @@ def _build_geojson(data: dict) -> dict:
         lon, lat = osm_nodes[node_id]
         deg = node_degree.get(node_id, 1)
         label = node_names.get(node_id, "")
+        if not label and deg == 1:
+            # Degree-1 nodes are trail endpoints; label them with the route(s)
+            # that actually produced the single edge touching this node.
+            seen = dict.fromkeys(node_routes.get(node_id, []))  # dedup, stable order
+            label = " / ".join(seen)
         point_features.append({
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [lon, lat]},
