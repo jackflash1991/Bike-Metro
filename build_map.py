@@ -452,8 +452,8 @@ def normalize_labels(data: dict) -> dict:
         if new_label != old_label:
             props["station_label"] = new_label
             normalized += 1
-        if props.get("has_parking"):
-            props["station_label"] = "🅿️ " + props["station_label"].strip()
+        # Parking icon (🅿️) is now applied in add_amenities() alongside other
+        # amenity icons so all icons appear after the name in priority order.
 
     # De-duplicate: loom corrupts labels when it receives two nearby nodes
     # with identical station_label values.  This can happen when an OSM node
@@ -499,13 +499,9 @@ def normalize_labels(data: dict) -> dict:
 
 # ── Stage 3c: Add amenity icons ──────────────────────────────────────
 
-# Maps (amenity_tag, value) → display emoji
-_AMENITY_ICONS = {
-    ("amenity", "bicycle_repair_station"): ("🔧️", "repair"),
-    ("information", "map"):                ("ℹ️",  "map"),
-    ("amenity", "drinking_water"):         ("🚰️",  "water"),
-    ("amenity", "toilets"):                ("🚻️",  "toilets"),
-}
+# Bike-centric icon priority: rider needs first, car access last.
+# All icons appear after the station name.
+_ICON_ORDER = ["🔧️", "🚰️", "🚻️", "ℹ️", "🅿️"]
 
 
 def add_amenities(data: dict) -> dict:
@@ -513,16 +509,21 @@ def add_amenities(data: dict) -> dict:
 
     Amenity types queried:
       🔧️  amenity=bicycle_repair_station
-      ℹ️   tourism=information + information=map
       🚰️  amenity=drinking_water
       🚻️  amenity=toilets (public / unspecified access only)
+      ℹ️   tourism=information + information=map
+      🅿️  has_parking flag set by add_trailheads (pre-seeded, no Overpass query)
+
+    Icon priority order (bike-centric): 🔧️ 🚰️ 🚻️ ℹ️ 🅿️
+    Parking appears last — it's useful context but not the primary concern
+    for a cyclist already on the trail.
 
     Only snaps to *existing* graph nodes (no edge splitting) within
     AMENITY_MATCH_DIST (~100 m).  A minimum-spacing rule (AMENITY_MIN_SPACING,
     ~200 m) prevents the same icon appearing on back-to-back nodes in
-    dense areas like Fairmount Park.  Icons are appended to whatever label
-    the node already carries; unlabeled-but-on-route nodes receive the icon
-    as their sole label so they survive the filter_nodes prune step.
+    dense areas like Fairmount Park.  Icons are collected per node then
+    written in _ICON_ORDER so label format is always consistent regardless
+    of Overpass return order.
     """
     south, west, north, east = BBOX
     query = f"""[out:json][timeout:60];
@@ -534,7 +535,7 @@ def add_amenities(data: dict) -> dict:
 );
 out;"""
 
-    log("amenities", "Querying Overpass for amenity POIs (repair, maps, water, restrooms)...")
+    log("amenities", "Querying Overpass for amenity POIs (repair, water, restrooms, maps)...")
     try:
         elements = overpass_query(query)
     except Exception as exc:
@@ -543,14 +544,20 @@ out;"""
 
     log("amenities", f"Found {len(elements)} amenity elements in bbox")
 
-    # Pre-collect Point features for fast nearest-node lookup
     points = [f for f in data["features"] if f["geometry"]["type"] == "Point"]
 
-    # Track placed icons per type to enforce minimum spacing
-    # icon_type → list of (lat, lon) where that icon was already placed
+    # Collect icons per node id — assembled in _ICON_ORDER at the end.
+    node_icons: dict[str, set[str]] = {}
+
+    # Pre-seed parking from the has_parking flag set by add_trailheads().
+    for feat in points:
+        if feat["properties"].get("has_parking"):
+            node_icons.setdefault(feat["properties"]["id"], set()).add("🅿️")
+
+    # Minimum-spacing tracking: icon_type → [(lat, lon), ...]
     placed: dict[str, list[tuple[float, float]]] = {}
 
-    added = 0
+    snapped = 0
     for elem in elements:
         tags = elem.get("tags", {})
         lon = elem.get("lon")
@@ -558,7 +565,6 @@ out;"""
         if lon is None or lat is None:
             continue
 
-        # Determine icon from tags
         amenity = tags.get("amenity", "")
         tourism  = tags.get("tourism", "")
         info     = tags.get("information", "")
@@ -574,43 +580,48 @@ out;"""
         else:
             continue
 
-        # Minimum-spacing check: skip if same icon type already placed nearby
+        # Minimum-spacing check
         if any(
             math.sqrt((lat - plat) ** 2 + (lon - plon) ** 2) < AMENITY_MIN_SPACING
             for plat, plon in placed.get(icon_type, [])
         ):
             continue
 
-        # Find nearest graph node within AMENITY_MATCH_DIST
-        best_dist, best_feat = float("inf"), None
+        # Nearest graph node within AMENITY_MATCH_DIST
+        best_dist, best_id = float("inf"), None
         for feat in points:
             nlon, nlat = feat["geometry"]["coordinates"]
             d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
             if d < best_dist:
-                best_dist, best_feat = d, feat
+                best_dist, best_id = d, feat["properties"]["id"]
 
-        if best_dist > AMENITY_MATCH_DIST or best_feat is None:
-            continue  # no trail node close enough
-
-        props = best_feat["properties"]
-        existing = props.get("station_label", "").strip()
-
-        # Don't duplicate the same icon on the same node
-        if icon in existing:
+        if best_dist > AMENITY_MATCH_DIST or best_id is None:
             continue
 
-        # Append icon (or use as sole label for unlabeled nodes)
-        if existing:
-            props["station_label"] = existing + " " + icon
-        else:
-            props["station_label"] = icon
-            props["station_id"] = props["id"]  # make node visible to transitmap
-
+        node_icons.setdefault(best_id, set()).add(icon)
         placed.setdefault(icon_type, []).append((lat, lon))
-        added += 1
+        snapped += 1
+
+    # Apply icons to nodes in defined priority order.
+    assembled = 0
+    id_to_feat = {f["properties"]["id"]: f for f in points}
+    for nid, icons in node_icons.items():
+        feat = id_to_feat.get(nid)
+        if not feat:
+            continue
+        props = feat["properties"]
+        ordered = [ic for ic in _ICON_ORDER if ic in icons]
+        if not ordered:
+            continue
+        base = props.get("station_label", "").strip()
+        icon_str = " ".join(ordered)
+        props["station_label"] = (base + " " + icon_str).strip() if base else icon_str
+        if not base:
+            props["station_id"] = nid  # make unlabeled node visible to transitmap
+        assembled += 1
 
     counts = {k: len(v) for k, v in placed.items()}
-    log("amenities", f"Added {added} amenity icons: {counts}")
+    log("amenities", f"Snapped {snapped} amenity POIs, applied icons to {assembled} nodes: {counts}")
     return data
 
 
