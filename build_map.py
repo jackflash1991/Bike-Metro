@@ -550,6 +550,49 @@ def process_rail() -> dict:
 
 # ── Stage 6: Merge + render SVG ──────────────────────────────────────
 
+_STLBLP_RE = re.compile(r'<path\b[^>]*\bid="stlblp\d+"[^>]*/>', re.DOTALL)
+_PATH_D_RE  = re.compile(r'\bd="([^"]+)"')
+_COORD_RE   = re.compile(r'[ML]\s*([-\d.]+)\s+([-\d.]+)')
+
+
+def _fix_label_paths(svg_file: str, extra: float = 20.0) -> None:
+    """Extend every station-label textPath by `extra` SVG units.
+
+    transitmap computes label-path lengths from font metrics that can
+    underestimate the rendered glyph width by a fraction of a character,
+    causing the last character to be silently clipped at the path end
+    (e.g. "Cromby" → "Cromb").  Extending each path by a small constant
+    gives all labels a safety margin without changing their visual position.
+    """
+    try:
+        content = Path(svg_file).read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    def _extend(m: re.Match) -> str:
+        tag = m.group(0)
+        d_m = _PATH_D_RE.search(tag)
+        if not d_m:
+            return tag
+        pts = [(float(x), float(y)) for x, y in _COORD_RE.findall(d_m.group(1))]
+        if len(pts) < 2:
+            return tag
+        dx = pts[-1][0] - pts[-2][0]
+        dy = pts[-1][1] - pts[-2][1]
+        seg = math.sqrt(dx * dx + dy * dy)
+        if seg < 0.001:
+            return tag
+        nx = pts[-1][0] + (dx / seg) * extra
+        ny = pts[-1][1] + (dy / seg) * extra
+        new_d = re.sub(r'([-\d.]+)\s+([-\d.]+)\s*$',
+                       f'{nx:.1f} {ny:.1f}', d_m.group(1))
+        return tag.replace(d_m.group(0), f'd="{new_d}"', 1)
+
+    fixed = _STLBLP_RE.sub(_extend, content)
+    if fixed != content:
+        Path(svg_file).write_text(fixed, encoding="utf-8")
+        log("render", f"Extended station label paths (+{extra:.0f} units) to fix font-metric clipping")
+
 def merge_and_render(trails: dict, rail: dict, out_dir: Path | None) -> None:
     merged = {
         "type": "FeatureCollection",
@@ -569,6 +612,8 @@ def merge_and_render(trails: dict, rail: dict, out_dir: Path | None) -> None:
     result = subprocess.run(cmd, shell=True)
     if result.returncode != 0:
         log("render", "WARNING: transitmap exited non-zero — SVG may be incomplete")
+
+    _fix_label_paths(OUTPUT_SVG)
 
     if out_dir:
         dest = out_dir / OUTPUT_SVG
