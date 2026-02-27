@@ -329,9 +329,11 @@ out center;"""
             if not props.get("station_label"):
                 props["station_label"] = name
                 props["station_id"] = props["id"]
+                if _is_parking(elem):
+                    props["has_parking"] = True
                 added += 1
         else:
-            unmatched.append((elem["id"], name, lon, lat))
+            unmatched.append((elem["id"], name, lon, lat, _is_parking(elem)))
 
     log("trailheads", f"Pass 1: labelled {added} existing nodes ({len(unmatched)} unmatched)")
 
@@ -340,7 +342,7 @@ out center;"""
     split_edge_indices: set[int] = set()  # each original edge consumed at most once
     new_items: list[tuple] = []           # (fi, edge1, edge2, point_feat)
 
-    for osm_id, name, lon, lat in unmatched:
+    for osm_id, name, lon, lat, is_park in unmatched:
         result = _nearest_edge(lon, lat, data["features"], TRAILHEAD_INSERT_DIST)
         if result is None:
             continue
@@ -370,17 +372,20 @@ out center;"""
             "geometry": {"type": "LineString", "coordinates": second_half},
             "properties": {"from": new_id, "to": props["to"], "lines": props["lines"]},
         }
+        point_props = {
+            "id": new_id,
+            "station_id": new_id,
+            "station_label": name,
+            "deg": "2",
+            "deg_in": "1",
+            "deg_out": "1",
+        }
+        if is_park:
+            point_props["has_parking"] = True
         point = {
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": [qlon, qlat]},
-            "properties": {
-                "id": new_id,
-                "station_id": new_id,
-                "station_label": name,
-                "deg": "2",
-                "deg_in": "1",
-                "deg_out": "1",
-            },
+            "properties": point_props,
         }
 
         split_edge_indices.add(fi)
@@ -433,6 +438,8 @@ def normalize_labels(data: dict) -> dict:
         if new_label != old_label:
             props["station_label"] = new_label
             normalized += 1
+        if props.get("has_parking"):
+            props["station_label"] = "🅿 " + props["station_label"].strip()
 
     log("labels", f"Normalized {normalized} station labels")
     return data
