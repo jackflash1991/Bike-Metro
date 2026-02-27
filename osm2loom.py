@@ -173,8 +173,17 @@ out center;
         # Flat list of all route-way nodes for nearest-neighbour scan.
         _route_nodes = [(nid, osm_nodes[nid]) for nid in route_node_ids if nid in osm_nodes]
 
+        # Process tagged trailheads before parking lots so a nearby parking lot
+        # can never overwrite a proper trailhead name on the same route node.
+        def _is_parking(e):
+            return e.get("tags", {}).get("amenity") == "parking"
+        _snap_elems_sorted = (
+            [e for e in _snap_elems if not _is_parking(e)] +
+            [e for e in _snap_elems if _is_parking(e)]
+        )
+
         _snapped = 0
-        for _e in _snap_elems:
+        for _e in _snap_elems_sorted:
             if _e["id"] in trailhead_on_routes:
                 continue  # already a member of a route way
             _name = _e.get("tags", {}).get("name", "")
