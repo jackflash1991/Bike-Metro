@@ -426,7 +426,10 @@ def normalize_labels(data: dict) -> dict:
                 if label:
                     route_names.add(label)
 
+    route_names_lower = {r.lower() for r in route_names}
+
     normalized = 0
+    cleared = 0
     for feat in data["features"]:
         if feat["geometry"]["type"] != "Point":
             continue
@@ -435,13 +438,18 @@ def normalize_labels(data: dict) -> dict:
         if not old_label:
             continue
         new_label = normalize_label(old_label, route_names)
+        # If the final label is just a route name, it adds no location info
+        # (common on endpoint nodes). Clear it so only a dot is rendered.
+        if new_label.lower() in route_names_lower:
+            new_label = ""
+            cleared += 1
         if new_label != old_label:
             props["station_label"] = new_label
             normalized += 1
         if props.get("has_parking"):
             props["station_label"] = "🅿 " + props["station_label"].strip()
 
-    log("labels", f"Normalized {normalized} station labels")
+    log("labels", f"Normalized {normalized} station labels, cleared {cleared} route-name-only labels")
     return data
 
 
