@@ -453,7 +453,7 @@ def normalize_labels(data: dict) -> dict:
             props["station_label"] = new_label
             normalized += 1
         if props.get("has_parking"):
-            props["station_label"] = "🅿 " + props["station_label"].strip()
+            props["station_label"] = "🅿️ " + props["station_label"].strip()
 
     # De-duplicate: loom corrupts labels when it receives two nearby nodes
     # with identical station_label values.  This can happen when an OSM node
@@ -501,10 +501,10 @@ def normalize_labels(data: dict) -> dict:
 
 # Maps (amenity_tag, value) → display emoji
 _AMENITY_ICONS = {
-    ("amenity", "bicycle_repair_station"): ("🔧", "repair"),
-    ("information", "map"):                ("ℹ",  "map"),
-    ("amenity", "drinking_water"):         ("🚰",  "water"),
-    ("amenity", "toilets"):                ("🚻",  "toilets"),
+    ("amenity", "bicycle_repair_station"): ("🔧️", "repair"),
+    ("information", "map"):                ("ℹ️",  "map"),
+    ("amenity", "drinking_water"):         ("🚰️",  "water"),
+    ("amenity", "toilets"):                ("🚻️",  "toilets"),
 }
 
 
@@ -512,10 +512,10 @@ def add_amenities(data: dict) -> dict:
     """Snap amenity POIs to trail nodes and append emoji icons to their labels.
 
     Amenity types queried:
-      🔧  amenity=bicycle_repair_station
-      ℹ   tourism=information + information=map
-      🚰  amenity=drinking_water
-      🚻  amenity=toilets (public / unspecified access only)
+      🔧️  amenity=bicycle_repair_station
+      ℹ️   tourism=information + information=map
+      🚰️  amenity=drinking_water
+      🚻️  amenity=toilets (public / unspecified access only)
 
     Only snaps to *existing* graph nodes (no edge splitting) within
     AMENITY_MATCH_DIST (~100 m).  A minimum-spacing rule (AMENITY_MIN_SPACING,
@@ -564,13 +564,13 @@ out;"""
         info     = tags.get("information", "")
 
         if amenity == "bicycle_repair_station":
-            icon, icon_type = "🔧", "repair"
+            icon, icon_type = "🔧️", "repair"
         elif tourism == "information" and info == "map":
-            icon, icon_type = "ℹ", "map"
+            icon, icon_type = "ℹ️", "map"
         elif amenity == "drinking_water":
-            icon, icon_type = "🚰", "water"
+            icon, icon_type = "🚰️", "water"
         elif amenity == "toilets":
-            icon, icon_type = "🚻", "toilets"
+            icon, icon_type = "🚻️", "toilets"
         else:
             continue
 
