@@ -14,6 +14,7 @@ Usage:
     python3 build_map.py --offline        # skip Overpass, use cached JSON
     python3 build_map.py --no-rail        # trails only, skip SEPTA
     python3 build_map.py --no-trailheads  # skip trailhead enrichment step
+    python3 build_map.py --no-amenities   # skip amenity icon pass
     python3 build_map.py --out DIR        # write SVG to DIR instead of default
     python3 build_map.py -h               # show this help
 
@@ -36,6 +37,7 @@ from pathlib import Path
 from config import (
     BBOX, OVERPASS_URL, OVERPASS_TIMEOUT, OVERPASS_MIRRORS,
     EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST, TRAILHEAD_INSERT_DIST, TRAIL_PARKING_RE,
+    AMENITY_MATCH_DIST, AMENITY_MIN_SPACING,
     LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
     CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
 )
@@ -495,6 +497,123 @@ def normalize_labels(data: dict) -> dict:
     return data
 
 
+# ── Stage 3c: Add amenity icons ──────────────────────────────────────
+
+# Maps (amenity_tag, value) → display emoji
+_AMENITY_ICONS = {
+    ("amenity", "bicycle_repair_station"): ("🔧", "repair"),
+    ("information", "map"):                ("🗺️",  "map"),
+    ("amenity", "drinking_water"):         ("💧",  "water"),
+    ("amenity", "toilets"):                ("🚻",  "toilets"),
+}
+
+
+def add_amenities(data: dict) -> dict:
+    """Snap amenity POIs to trail nodes and append emoji icons to their labels.
+
+    Amenity types queried:
+      🔧  amenity=bicycle_repair_station
+      🗺️   tourism=information + information=map
+      💧  amenity=drinking_water
+      🚻  amenity=toilets (public / unspecified access only)
+
+    Only snaps to *existing* graph nodes (no edge splitting) within
+    AMENITY_MATCH_DIST (~100 m).  A minimum-spacing rule (AMENITY_MIN_SPACING,
+    ~200 m) prevents the same icon appearing on back-to-back nodes in
+    dense areas like Fairmount Park.  Icons are appended to whatever label
+    the node already carries; unlabeled-but-on-route nodes receive the icon
+    as their sole label so they survive the filter_nodes prune step.
+    """
+    south, west, north, east = BBOX
+    query = f"""[out:json][timeout:60];
+(
+  node["amenity"="bicycle_repair_station"]({south},{west},{north},{east});
+  node["tourism"="information"]["information"="map"]({south},{west},{north},{east});
+  node["amenity"="drinking_water"]({south},{west},{north},{east});
+  node["amenity"="toilets"]["access"!="private"]({south},{west},{north},{east});
+);
+out;"""
+
+    log("amenities", "Querying Overpass for amenity POIs (repair, maps, water, restrooms)...")
+    try:
+        elements = overpass_query(query)
+    except Exception as exc:
+        log("amenities", f"Overpass error: {exc} — skipping amenity icons")
+        return data
+
+    log("amenities", f"Found {len(elements)} amenity elements in bbox")
+
+    # Pre-collect Point features for fast nearest-node lookup
+    points = [f for f in data["features"] if f["geometry"]["type"] == "Point"]
+
+    # Track placed icons per type to enforce minimum spacing
+    # icon_type → list of (lat, lon) where that icon was already placed
+    placed: dict[str, list[tuple[float, float]]] = {}
+
+    added = 0
+    for elem in elements:
+        tags = elem.get("tags", {})
+        lon = elem.get("lon")
+        lat = elem.get("lat")
+        if lon is None or lat is None:
+            continue
+
+        # Determine icon from tags
+        amenity = tags.get("amenity", "")
+        tourism  = tags.get("tourism", "")
+        info     = tags.get("information", "")
+
+        if amenity == "bicycle_repair_station":
+            icon, icon_type = "🔧", "repair"
+        elif tourism == "information" and info == "map":
+            icon, icon_type = "🗺️", "map"
+        elif amenity == "drinking_water":
+            icon, icon_type = "💧", "water"
+        elif amenity == "toilets":
+            icon, icon_type = "🚻", "toilets"
+        else:
+            continue
+
+        # Minimum-spacing check: skip if same icon type already placed nearby
+        if any(
+            math.sqrt((lat - plat) ** 2 + (lon - plon) ** 2) < AMENITY_MIN_SPACING
+            for plat, plon in placed.get(icon_type, [])
+        ):
+            continue
+
+        # Find nearest graph node within AMENITY_MATCH_DIST
+        best_dist, best_feat = float("inf"), None
+        for feat in points:
+            nlon, nlat = feat["geometry"]["coordinates"]
+            d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
+            if d < best_dist:
+                best_dist, best_feat = d, feat
+
+        if best_dist > AMENITY_MATCH_DIST or best_feat is None:
+            continue  # no trail node close enough
+
+        props = best_feat["properties"]
+        existing = props.get("station_label", "").strip()
+
+        # Don't duplicate the same icon on the same node
+        if icon in existing:
+            continue
+
+        # Append icon (or use as sole label for unlabeled nodes)
+        if existing:
+            props["station_label"] = existing + " " + icon
+        else:
+            props["station_label"] = icon
+            props["station_id"] = props["id"]  # make node visible to transitmap
+
+        placed.setdefault(icon_type, []).append((lat, lon))
+        added += 1
+
+    counts = {k: len(v) for k, v in placed.items()}
+    log("amenities", f"Added {added} amenity icons: {counts}")
+    return data
+
+
 # ── Stage 4: Prune unnamed interior nodes ────────────────────────────
 
 def filter_nodes(data: dict) -> dict:
@@ -654,6 +773,8 @@ def parse_args() -> argparse.Namespace:
                    help="Skip SEPTA regional rail processing")
     p.add_argument("--no-trailheads", action="store_true",
                    help="Skip trailhead label enrichment")
+    p.add_argument("--no-amenities", action="store_true",
+                   help="Skip amenity icon pass (repair stands, maps, water, restrooms)")
     p.add_argument("--out", metavar="DIR",
                    help="Directory to copy the output SVG into")
     return p.parse_args()
@@ -676,6 +797,10 @@ def main() -> None:
     else:
         log("trailheads", "Skipped")
     data = normalize_labels(data)   # strip route names + generic suffixes from all labels
+    if not args.no_amenities and not args.offline:
+        data = add_amenities(data)
+    else:
+        log("amenities", "Skipped")
     data = filter_nodes(data)
 
     Path(FILTERED_FILE).write_text(json.dumps(data))
