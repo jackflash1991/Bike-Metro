@@ -202,42 +202,25 @@ def normalize_label(name: str, route_names: set) -> str:
       5. Fall back to the original name if even the suffix-stripped version
          is empty.
     """
-    _debug = "cromb" in name.lower()
-
     # Step 1 – strip suffix
     after_suffix = _SUFFIX_RE.sub("", name).strip()
-    if _debug:
-        print(f"[normalize_label DEBUG] input={name!r}", flush=True)
-        print(f"[normalize_label DEBUG]   after_suffix={after_suffix!r}", flush=True)
 
     # Step 2 – strip route names (longest first)
     after_routes = after_suffix
     for rname in sorted(route_names, key=len, reverse=True):
         if len(rname) < 5:
             continue  # skip very short names to avoid false positives
-        new = re.sub(r"\b" + re.escape(rname) + r"\b", "", after_routes, flags=re.IGNORECASE)
-        if _debug and new != after_routes:
-            print(f"[normalize_label DEBUG]   route strip {rname!r}: {after_routes!r} -> {new!r}", flush=True)
-        after_routes = new
-
-    if _debug:
-        print(f"[normalize_label DEBUG]   after_routes={after_routes!r}", flush=True)
+        after_routes = re.sub(r"\b" + re.escape(rname) + r"\b", "", after_routes, flags=re.IGNORECASE)
 
     # Step 3 – clean connectors (repeat a few times to handle chains)
     for _ in range(3):
         after_routes = _CONNECTOR_RE.sub("", after_routes).strip(" ,.-&/")
 
-    if _debug:
-        print(f"[normalize_label DEBUG]   after_connectors={after_routes!r}", flush=True)
-
     # Step 4 – fall back to suffix-stripped version if route-stripping went too far
     result = after_routes if len(after_routes) >= 3 else after_suffix
 
     # Step 5 – ultimate fallback
-    final = result.strip() if len(result.strip()) >= 3 else name
-    if _debug:
-        print(f"[normalize_label DEBUG]   final={final!r}", flush=True)
-    return final
+    return result.strip() if len(result.strip()) >= 3 else name
 
 
 # ── Stage 3: Enrich with trailhead labels ────────────────────────────
@@ -470,7 +453,45 @@ def normalize_labels(data: dict) -> dict:
         if props.get("has_parking"):
             props["station_label"] = "🅿 " + props["station_label"].strip()
 
-    log("labels", f"Normalized {normalized} station labels, cleared {cleared} route-name-only labels")
+    # De-duplicate: loom corrupts labels when it receives two nearby nodes
+    # with identical station_label values.  This can happen when an OSM node
+    # has name="X" AND a separate route node within snap range gets labelled
+    # "X Trailhead" (both normalize to "X").  Keep the more authoritative one
+    # (osm_named > not osm_named; otherwise lower degree = endpoint wins).
+    _dedup_dist_sq = (2 * TRAILHEAD_MATCH_DIST) ** 2
+    labeled_pts = [
+        (feat, feat["geometry"]["coordinates"][0], feat["geometry"]["coordinates"][1])
+        for feat in data["features"]
+        if feat["geometry"]["type"] == "Point"
+        and feat["properties"].get("station_label", "").strip()
+    ]
+    deduped = 0
+    for i in range(len(labeled_pts)):
+        feat_i, lon_i, lat_i = labeled_pts[i]
+        label_i = feat_i["properties"].get("station_label", "").strip()
+        if not label_i:
+            continue
+        for j in range(i + 1, len(labeled_pts)):
+            feat_j, lon_j, lat_j = labeled_pts[j]
+            label_j = feat_j["properties"].get("station_label", "").strip()
+            if not label_j or label_i.lower() != label_j.lower():
+                continue
+            if (lon_i - lon_j) ** 2 + (lat_i - lat_j) ** 2 >= _dedup_dist_sq:
+                continue
+            # Same label within ~400 m — drop the less authoritative one.
+            i_named = bool(feat_i["properties"].get("osm_named"))
+            j_named = bool(feat_j["properties"].get("osm_named"))
+            i_deg = int(feat_i["properties"].get("deg", 2))
+            j_deg = int(feat_j["properties"].get("deg", 2))
+            drop_j = (i_named and not j_named) or (i_named == j_named and i_deg <= j_deg)
+            victim = feat_j if drop_j else feat_i
+            victim["properties"]["station_label"] = ""
+            victim["properties"]["station_id"] = ""
+            deduped += 1
+            break
+
+    log("labels", f"Normalized {normalized} station labels, cleared {cleared} route-name-only labels"
+        + (f", de-duplicated {deduped}" if deduped else ""))
     return data
 
 
