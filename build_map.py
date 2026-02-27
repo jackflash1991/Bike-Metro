@@ -329,6 +329,7 @@ out center;"""
             if not props.get("station_label"):
                 props["station_label"] = name
                 props["station_id"] = props["id"]
+                props["osm_named"] = True
                 if _is_parking(elem):
                     props["has_parking"] = True
                 added += 1
@@ -376,6 +377,7 @@ out center;"""
             "id": new_id,
             "station_id": new_id,
             "station_label": name,
+            "osm_named": True,
             "deg": "2",
             "deg_in": "1",
             "deg_out": "1",
@@ -438,9 +440,11 @@ def normalize_labels(data: dict) -> dict:
         if not old_label:
             continue
         new_label = normalize_label(old_label, route_names)
-        # If the final label is just a route name, it adds no location info
-        # (common on endpoint nodes). Clear it so only a dot is rendered.
-        if new_label.lower() in route_names_lower:
+        # If the final label is just a route name and the node was NOT
+        # explicitly named by an OSM trailhead/parking element, clear it.
+        # This removes auto-assigned route names from bare endpoint nodes
+        # while preserving official trailhead names that happen to match.
+        if new_label.lower() in route_names_lower and not props.get("osm_named"):
             new_label = ""
             cleared += 1
         if new_label != old_label:
