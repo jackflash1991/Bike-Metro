@@ -326,12 +326,12 @@ out center;"""
 
         if best_dist < TRAILHEAD_MATCH_DIST and best_feat:
             props = best_feat["properties"]
+            if _is_parking(elem):
+                props["has_parking"] = True
             if not props.get("station_label"):
                 props["station_label"] = name
                 props["station_id"] = props["id"]
                 props["osm_named"] = True
-                if _is_parking(elem):
-                    props["has_parking"] = True
                 added += 1
         else:
             unmatched.append((elem["id"], name, lon, lat, _is_parking(elem)))
