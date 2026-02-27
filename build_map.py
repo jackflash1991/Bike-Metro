@@ -202,25 +202,42 @@ def normalize_label(name: str, route_names: set) -> str:
       5. Fall back to the original name if even the suffix-stripped version
          is empty.
     """
+    _debug = "cromb" in name.lower()
+
     # Step 1 – strip suffix
     after_suffix = _SUFFIX_RE.sub("", name).strip()
+    if _debug:
+        print(f"[normalize_label DEBUG] input={name!r}", flush=True)
+        print(f"[normalize_label DEBUG]   after_suffix={after_suffix!r}", flush=True)
 
     # Step 2 – strip route names (longest first)
     after_routes = after_suffix
     for rname in sorted(route_names, key=len, reverse=True):
         if len(rname) < 5:
             continue  # skip very short names to avoid false positives
-        after_routes = re.sub(r"\b" + re.escape(rname) + r"\b", "", after_routes, flags=re.IGNORECASE)
+        new = re.sub(r"\b" + re.escape(rname) + r"\b", "", after_routes, flags=re.IGNORECASE)
+        if _debug and new != after_routes:
+            print(f"[normalize_label DEBUG]   route strip {rname!r}: {after_routes!r} -> {new!r}", flush=True)
+        after_routes = new
+
+    if _debug:
+        print(f"[normalize_label DEBUG]   after_routes={after_routes!r}", flush=True)
 
     # Step 3 – clean connectors (repeat a few times to handle chains)
     for _ in range(3):
         after_routes = _CONNECTOR_RE.sub("", after_routes).strip(" ,.-&/")
 
+    if _debug:
+        print(f"[normalize_label DEBUG]   after_connectors={after_routes!r}", flush=True)
+
     # Step 4 – fall back to suffix-stripped version if route-stripping went too far
     result = after_routes if len(after_routes) >= 3 else after_suffix
 
     # Step 5 – ultimate fallback
-    return result.strip() if len(result.strip()) >= 3 else name
+    final = result.strip() if len(result.strip()) >= 3 else name
+    if _debug:
+        print(f"[normalize_label DEBUG]   final={final!r}", flush=True)
+    return final
 
 
 # ── Stage 3: Enrich with trailhead labels ────────────────────────────
