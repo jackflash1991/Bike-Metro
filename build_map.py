@@ -180,8 +180,8 @@ _SUFFIX_RE = re.compile(
 )
 # Leftover connector words after route names have been removed.
 _CONNECTOR_RE = re.compile(
-    r"^\s*(\band\b|\bor\b|&|at|near|[-,/])\s*"
-    r"|\s*(\band\b|\bor\b|&|at|near|[-,/])\s*$",
+    r"^\s*(\band\b|\bor\b|&|\bat\b|\bnear\b|[-,/])\s*"
+    r"|\s*(\band\b|\bor\b|&|\bat\b|\bnear\b|[-,/])\s*$",
     re.IGNORECASE,
 )
 
@@ -210,7 +210,7 @@ def normalize_label(name: str, route_names: set) -> str:
     for rname in sorted(route_names, key=len, reverse=True):
         if len(rname) < 5:
             continue  # skip very short names to avoid false positives
-        after_routes = re.sub(re.escape(rname), "", after_routes, flags=re.IGNORECASE)
+        after_routes = re.sub(r"\b" + re.escape(rname) + r"\b", "", after_routes, flags=re.IGNORECASE)
 
     # Step 3 – clean connectors (repeat a few times to handle chains)
     for _ in range(3):
