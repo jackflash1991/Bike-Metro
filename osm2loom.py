@@ -18,13 +18,14 @@ How it works:
 """
 
 import json
+import math
 import sys
 import hashlib
 import urllib.request
 import urllib.parse
 from collections import defaultdict
 
-from config import BBOX_STR, OVERPASS_URL, OVERPASS_TIMEOUT
+from config import BBOX_STR, OVERPASS_URL, OVERPASS_TIMEOUT, OVERPASS_MIRRORS, TRAILHEAD_SNAP_DIST, TRAIL_PARKING_RE
 
 
 # ── Color helpers ────────────────────────────────────────────────────
@@ -41,7 +42,10 @@ def deterministic_color(name: str) -> str:
 # ── Overpass fetch ───────────────────────────────────────────────────
 
 def query_overpass(bbox: str) -> dict:
-    """Query Overpass for bicycle route relations + full geometry."""
+    """Query Overpass for bicycle route relations + full geometry.
+
+    Tries each mirror in OVERPASS_MIRRORS in order, falling back on 5xx / timeout.
+    """
     query = f"""
 [out:json][timeout:{OVERPASS_TIMEOUT}];
 relation["type"="route"]["route"="bicycle"]({bbox});
@@ -50,11 +54,18 @@ out body;
 """
     _log("Querying Overpass API...")
     encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    req = urllib.request.Request(OVERPASS_URL, data=encoded)
-    with urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 30) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    _log(f"Received {len(result['elements'])} elements")
-    return result
+    last_exc: Exception = RuntimeError("No mirrors configured")
+    for mirror in OVERPASS_MIRRORS:
+        try:
+            req = urllib.request.Request(mirror, data=encoded)
+            with urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            _log(f"Received {len(result['elements'])} elements (via {mirror})")
+            return result
+        except Exception as exc:
+            _log(f"  {mirror} failed ({exc.__class__.__name__}: {exc}) — trying next mirror")
+            last_exc = exc
+    raise last_exc
 
 
 # ── Core build logic ─────────────────────────────────────────────────
@@ -125,6 +136,79 @@ def _build_geojson(data: dict) -> dict:
                 route_node_ids.update(osm_ways[wid])
     trailhead_on_routes = trailhead_nodes & route_node_ids
     _log(f"  ({len(trailhead_on_routes)} trailheads are on route ways)")
+
+    # ── Snap nearby external trailheads to route nodes ───────────────
+    # Run a separate Overpass query for ALL trailheads in the bbox (not just
+    # those that happen to be tagged as part of a bicycle route relation).
+    # For each external trailhead within TRAILHEAD_SNAP_DIST of a route-way
+    # node, snap it: that node joins the split-point set so it becomes a
+    # labelled station, and the trailhead's name is used as the label.
+    _log("Querying Overpass for external trailheads to snap...")
+    _snap_query = f"""
+[out:json][timeout:60];
+(
+  node["highway"="trailhead"]({BBOX_STR});
+  node["tourism"="information"]["information"="trailhead"]({BBOX_STR});
+  node["amenity"="parking"]["name"~"{TRAIL_PARKING_RE}",i]({BBOX_STR});
+  way["amenity"="parking"]["name"~"{TRAIL_PARKING_RE}",i]({BBOX_STR});
+);
+out center;
+"""
+    try:
+        _enc = urllib.parse.urlencode({"data": _snap_query}).encode("utf-8")
+        _snap_elems = None
+        for _mirror in OVERPASS_MIRRORS:
+            try:
+                with urllib.request.urlopen(
+                    urllib.request.Request(_mirror, data=_enc), timeout=90
+                ) as _resp:
+                    _snap_elems = json.loads(_resp.read().decode("utf-8"))["elements"]
+                break
+            except Exception as _me:
+                _log(f"  {_mirror} failed ({_me.__class__.__name__}: {_me}) — trying next mirror")
+        if _snap_elems is None:
+            raise RuntimeError("All mirrors failed for snap query")
+        _log(f"  Found {len(_snap_elems)} total trailheads/parking in bbox")
+
+        # Flat list of all route-way nodes for nearest-neighbour scan.
+        _route_nodes = [(nid, osm_nodes[nid]) for nid in route_node_ids if nid in osm_nodes]
+
+        # Process tagged trailheads before parking lots so a nearby parking lot
+        # can never overwrite a proper trailhead name on the same route node.
+        def _is_parking(e):
+            return e.get("tags", {}).get("amenity") == "parking"
+        _snap_elems_sorted = (
+            [e for e in _snap_elems if not _is_parking(e)] +
+            [e for e in _snap_elems if _is_parking(e)]
+        )
+
+        _snapped = 0
+        for _e in _snap_elems_sorted:
+            if _e["id"] in trailhead_on_routes:
+                continue  # already a member of a route way
+            _name = _e.get("tags", {}).get("name", "")
+            # Nodes have lon/lat directly; ways return a center object.
+            _tlon = _e.get("lon") or (_e.get("center") or {}).get("lon")
+            _tlat = _e.get("lat") or (_e.get("center") or {}).get("lat")
+            if _tlon is None or _tlat is None:
+                continue
+
+            _best_dist, _best_nid = float("inf"), None
+            for _nid, (_nlon, _nlat) in _route_nodes:
+                _d = math.sqrt((_tlon - _nlon) ** 2 + (_tlat - _nlat) ** 2)
+                if _d < _best_dist:
+                    _best_dist, _best_nid = _d, _nid
+
+            if _best_nid is not None and _best_dist < TRAILHEAD_SNAP_DIST:
+                trailhead_on_routes.add(_best_nid)
+                if _name and _best_nid not in node_names:
+                    node_names[_best_nid] = _name
+                _snapped += 1
+
+        _log(f"  Snapped {_snapped} external trailheads to route nodes "
+             f"(total split-points: {len(trailhead_on_routes)})")
+    except Exception as _exc:
+        _log(f"  Warning: external trailhead snap failed ({_exc}) — skipping")
 
     # Build edge features, splitting ways at mid-way trailheads
     edge_features = []

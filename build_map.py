@@ -27,14 +27,15 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from config import (
-    BBOX, OVERPASS_URL, OVERPASS_TIMEOUT,
-    EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST,
+    BBOX, OVERPASS_URL, OVERPASS_TIMEOUT, OVERPASS_MIRRORS,
+    EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST, TRAILHEAD_INSERT_DIST, TRAIL_PARKING_RE,
     LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
     CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
 )
@@ -72,12 +73,19 @@ def check_binaries(need_rail: bool) -> None:
 
 
 def overpass_query(query: str) -> list:
-    """POST a query to Overpass and return the elements list."""
-    data = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    req = urllib.request.Request(OVERPASS_URL, data=data)
-    with urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 30) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    return result["elements"]
+    """POST a query to Overpass, falling back through mirrors on 5xx / timeout."""
+    encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
+    last_exc: Exception = RuntimeError("No mirrors configured")
+    for mirror in OVERPASS_MIRRORS:
+        try:
+            req = urllib.request.Request(mirror, data=encoded)
+            with urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            return result["elements"]
+        except Exception as exc:
+            log("overpass", f"{mirror} failed ({exc.__class__.__name__}: {exc}) — trying next mirror")
+            last_exc = exc
+    raise last_exc
 
 
 def detect_output_dir(cli_out: str | None) -> Path | None:
@@ -160,30 +168,152 @@ def filter_routes(data: dict) -> dict:
     return data
 
 
+# ── Label normalisation helpers ───────────────────────────────────────
+
+# Generic words / phrases that add no useful location information.
+_SUFFIX_RE = re.compile(
+    r"[\s,\-]*\b("
+    r"trailhead|trail\s+head|parking\s+area|parking\s+lot"
+    r"|parking|access\s+point|access\s+area|access"
+    r")\b[\s,\-]*$",
+    re.IGNORECASE,
+)
+# Leftover connector words after route names have been removed.
+_CONNECTOR_RE = re.compile(
+    r"^\s*(\band\b|\bor\b|&|at|near|[-,/])\s*"
+    r"|\s*(\band\b|\bor\b|&|at|near|[-,/])\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_label(name: str, route_names: set) -> str:
+    """Shorten a trailhead / parking label for use as a metro-map station name.
+
+    Steps (in order):
+      1. Strip generic suffixes: "Trailhead", "Parking", "Parking Area", etc.
+      2. Strip substrings that exactly match a known route name — they are
+         redundant because the station already appears on those lines.
+         Route names are stripped longest-first to avoid leaving fragments.
+      3. Clean up leftover connectors ("and", "&", "-", …).
+      4. Fall back to the suffix-stripped version if route stripping leaves
+         less than 3 characters (e.g. "Audubon Loop Trail Trailhead" →
+         suffix-strip → "Audubon Loop Trail" → route-strip → "" → fall back
+         to "Audubon Loop Trail").
+      5. Fall back to the original name if even the suffix-stripped version
+         is empty.
+    """
+    # Step 1 – strip suffix
+    after_suffix = _SUFFIX_RE.sub("", name).strip()
+
+    # Step 2 – strip route names (longest first)
+    after_routes = after_suffix
+    for rname in sorted(route_names, key=len, reverse=True):
+        if len(rname) < 5:
+            continue  # skip very short names to avoid false positives
+        after_routes = re.sub(re.escape(rname), "", after_routes, flags=re.IGNORECASE)
+
+    # Step 3 – clean connectors (repeat a few times to handle chains)
+    for _ in range(3):
+        after_routes = _CONNECTOR_RE.sub("", after_routes).strip(" ,.-&/")
+
+    # Step 4 – fall back to suffix-stripped version if route-stripping went too far
+    result = after_routes if len(after_routes) >= 3 else after_suffix
+
+    # Step 5 – ultimate fallback
+    return result.strip() if len(result.strip()) >= 3 else name
+
+
 # ── Stage 3: Enrich with trailhead labels ────────────────────────────
 
+def _project_onto_segment(
+    px: float, py: float,
+    ax: float, ay: float,
+    bx: float, by: float,
+) -> tuple[float, float, float, float]:
+    """Return (proj_x, proj_y, t, dist) — nearest point on segment AB to P."""
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq == 0:
+        return ax, ay, 0.0, math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
+    t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    qx, qy = ax + t * dx, ay + t * dy
+    return qx, qy, t, math.sqrt((px - qx) ** 2 + (py - qy) ** 2)
+
+
+def _nearest_edge(
+    lon: float, lat: float,
+    features: list,
+    max_dist: float,
+) -> tuple | None:
+    """Find nearest point on any LineString feature within max_dist.
+
+    Returns (feature_index, segment_index, t, proj_lon, proj_lat) or None.
+    """
+    best_dist = max_dist
+    best: tuple | None = None
+    for fi, feat in enumerate(features):
+        if feat["geometry"]["type"] != "LineString":
+            continue
+        coords = feat["geometry"]["coordinates"]
+        for si in range(len(coords) - 1):
+            ax, ay = coords[si]
+            bx, by = coords[si + 1]
+            qx, qy, t, d = _project_onto_segment(lon, lat, ax, ay, bx, by)
+            if d < best_dist:
+                best_dist = d
+                best = (fi, si, t, qx, qy)
+    return best
+
+
 def add_trailheads(data: dict) -> dict:
+    """Enrich the graph with trailhead station labels.
+
+    Pass 1 — label nearest existing graph node (≤ TRAILHEAD_MATCH_DIST, ~200 m).
+    Pass 2 — for still-unmatched trailheads, project perpendicularly onto the
+              nearest route edge (≤ TRAILHEAD_INSERT_DIST, ~100 m), split that
+              edge, and insert a new synthetic station node at the projection
+              point.  This handles trailheads beside long segments with no
+              nearby OSM node.
+    """
     south, west, north, east = BBOX
     query = f"""[out:json][timeout:60];
 (
   node["highway"="trailhead"]({south},{west},{north},{east});
   node["tourism"="information"]["information"="trailhead"]({south},{west},{north},{east});
+  node["amenity"="parking"]["name"~"{TRAIL_PARKING_RE}",i]({south},{west},{north},{east});
+  way["amenity"="parking"]["name"~"{TRAIL_PARKING_RE}",i]({south},{west},{north},{east});
 );
-out body;"""
+out center;"""
 
-    log("trailheads", "Querying Overpass for trailhead nodes...")
+    log("trailheads", "Querying Overpass for trailhead nodes and trail parking...")
     try:
         elements = overpass_query(query)
     except Exception as exc:
         log("trailheads", f"Overpass error: {exc} — skipping enrichment")
         return data
 
+    # ── Pass 1: label nearest existing graph node ─────────────────────
+    # Process tagged trailheads before parking lots so a parking lot can never
+    # overwrite a proper trailhead label on the same nearby node.
+    def _is_parking(e):
+        return e.get("tags", {}).get("amenity") == "parking"
+    elements = (
+        [e for e in elements if not _is_parking(e)] +
+        [e for e in elements if _is_parking(e)]
+    )
+
     added = 0
+    unmatched: list[tuple] = []  # (osm_id, name, lon, lat) — candidates for pass 2
     for elem in elements:
         name = elem.get("tags", {}).get("name", "")
         if not name:
             continue
-        lon, lat = elem["lon"], elem["lat"]
+        # Nodes have lon/lat directly; ways return a center object.
+        lon = elem.get("lon") or (elem.get("center") or {}).get("lon")
+        lat = elem.get("lat") or (elem.get("center") or {}).get("lat")
+        if lon is None or lat is None:
+            continue
 
         best_dist, best_feat = float("inf"), None
         for feat in data["features"]:
@@ -200,12 +330,111 @@ out body;"""
                 props["station_label"] = name
                 props["station_id"] = props["id"]
                 added += 1
+        else:
+            unmatched.append((elem["id"], name, lon, lat))
+
+    log("trailheads", f"Pass 1: labelled {added} existing nodes ({len(unmatched)} unmatched)")
+
+    # ── Pass 2: project unmatched trailheads onto nearest route edge ──
+    inserted = 0
+    split_edge_indices: set[int] = set()  # each original edge consumed at most once
+    new_items: list[tuple] = []           # (fi, edge1, edge2, point_feat)
+
+    for osm_id, name, lon, lat in unmatched:
+        result = _nearest_edge(lon, lat, data["features"], TRAILHEAD_INSERT_DIST)
+        if result is None:
+            continue
+        fi, si, _t, qlon, qlat = result
+        if fi in split_edge_indices:
+            continue  # another trailhead already claimed this edge
+
+        orig = data["features"][fi]
+        coords = orig["geometry"]["coordinates"]
+        props = orig["properties"]
+
+        # Synthetic node id — deterministic, won't collide with real OSM ids.
+        new_id = f"th_{osm_id}"
+
+        first_half = coords[: si + 1] + [[qlon, qlat]]
+        second_half = [[qlon, qlat]] + coords[si + 1 :]
+        if len(first_half) < 2 or len(second_half) < 2:
+            continue  # degenerate split — skip
+
+        edge1 = {
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": first_half},
+            "properties": {"from": props["from"], "to": new_id, "lines": props["lines"]},
+        }
+        edge2 = {
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": second_half},
+            "properties": {"from": new_id, "to": props["to"], "lines": props["lines"]},
+        }
+        point = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [qlon, qlat]},
+            "properties": {
+                "id": new_id,
+                "station_id": new_id,
+                "station_label": name,
+                "deg": "2",
+                "deg_in": "1",
+                "deg_out": "1",
+            },
+        }
+
+        split_edge_indices.add(fi)
+        new_items.append((fi, edge1, edge2, point))
+        inserted += 1
+
+    if new_items:
+        remove = {item[0] for item in new_items}
+        data["features"] = [f for i, f in enumerate(data["features"]) if i not in remove]
+        for _, e1, e2, pt in new_items:
+            data["features"].extend([pt, e1, e2])
+
+    log("trailheads", f"Pass 2: inserted {inserted} new trailhead stations on edges")
 
     labeled = sum(
         1 for f in data["features"]
         if f["geometry"]["type"] == "Point" and f["properties"].get("station_label")
     )
-    log("trailheads", f"Added {added} trailhead labels (total labeled nodes: {labeled})")
+    log("trailheads", f"Total labelled stations: {labeled}")
+    return data
+
+
+# ── Stage 3b: Normalize station labels ───────────────────────────────
+
+def normalize_labels(data: dict) -> dict:
+    """Strip redundant route names and generic suffixes from all station labels.
+
+    Route names are collected from the graph itself so they are always current
+    without any hardcoding.  Normalisation is applied to every labelled Point
+    feature, including labels set by osm2loom's snap pass.
+    """
+    # Collect every route name present in the graph.
+    route_names: set[str] = set()
+    for feat in data["features"]:
+        if feat["geometry"]["type"] == "LineString":
+            for line in feat.get("properties", {}).get("lines", []):
+                label = line.get("label", "").strip()
+                if label:
+                    route_names.add(label)
+
+    normalized = 0
+    for feat in data["features"]:
+        if feat["geometry"]["type"] != "Point":
+            continue
+        props = feat["properties"]
+        old_label = props.get("station_label", "").strip()
+        if not old_label:
+            continue
+        new_label = normalize_label(old_label, route_names)
+        if new_label != old_label:
+            props["station_label"] = new_label
+            normalized += 1
+
+    log("labels", f"Normalized {normalized} station labels")
     return data
 
 
@@ -236,28 +465,30 @@ def filter_nodes(data: dict) -> dict:
     return data
 
 
-# ── Stage 5a: Strip colors (let transitmap assign via --random-colors) ─
+# ── Stage 5b: Optional SEPTA rail ────────────────────────────────────
 
-def strip_colors(data: dict) -> dict:
-    for feat in data["features"]:
-        for line in feat.get("properties", {}).get("lines", []):
-            line["color"] = ""
+def _gtfs_to_loom(gtfs_dir: str, label: str) -> dict:
+    """Run a GTFS directory through gtfs2graph | topo and return topo-format GeoJSON.
+
+    We stop *before* loom so that trail data (also in topo format from osm2loom)
+    and rail data can be merged at the same stage and processed together by the
+    single  ./loom | ./transitmap  call in merge_and_render.  Running loom on
+    rail first and then again on the merged output causes rail features to be
+    silently dropped.
+    """
+    r1 = subprocess.run(f"./gtfs2graph -m rail {gtfs_dir}", shell=True, capture_output=True)
+    r2 = subprocess.run("./topo", shell=True, input=r1.stdout, capture_output=True)
+    if r2.returncode != 0:
+        log("rail", f"WARNING: topo failed on {label} — skipping")
+        return {"type": "FeatureCollection", "features": []}
+    data = json.loads(r2.stdout)
+    log("rail", f"{label}: {len(data['features'])} features loaded")
     return data
 
 
-# ── Stage 5b: Optional SEPTA rail ────────────────────────────────────
-
 def process_rail() -> dict:
-    log("rail", "Processing SEPTA regional rail (gtfs2graph | topo | loom)...")
-    r1 = subprocess.run("./gtfs2graph -m rail google_rail.zip", shell=True, capture_output=True)
-    r2 = subprocess.run("./topo", shell=True, input=r1.stdout, capture_output=True)
-    r3 = subprocess.run("./loom", shell=True, input=r2.stdout, capture_output=True)
-    if r3.returncode != 0:
-        log("rail", "WARNING: loom failed on rail data — skipping rail")
-        return {"type": "FeatureCollection", "features": []}
-    rail = json.loads(r3.stdout)
-    log("rail", f"{len(rail['features'])} rail features loaded")
-    return rail
+    log("rail", "Processing rail (SEPTA + Keystone merged)...")
+    return _gtfs_to_loom("combined_rail_gtfs/", "SEPTA + Keystone")
 
 
 # ── Stage 6: Merge + render SVG ──────────────────────────────────────
@@ -272,7 +503,7 @@ def merge_and_render(trails: dict, rail: dict, out_dir: Path | None) -> None:
 
     log("render", "Generating SVG via loom | transitmap...")
     cmd = (
-        f"cat {COMBINED_FILE} | ./loom | ./transitmap -l --random-colors "
+        f"cat {COMBINED_FILE} | ./loom | ./transitmap -l "
         f"--line-width={LINE_WIDTH} --line-spacing={LINE_SPACING} "
         f"--station-label-textsize={STATION_LABEL_SIZE} "
         f"--line-label-textsize={LINE_LABEL_SIZE} "
@@ -342,8 +573,8 @@ def main() -> None:
         data = add_trailheads(data)
     else:
         log("trailheads", "Skipped")
+    data = normalize_labels(data)   # strip route names + generic suffixes from all labels
     data = filter_nodes(data)
-    data = strip_colors(data)
 
     Path(FILTERED_FILE).write_text(json.dumps(data))
     log("trails", f"Filtered trail data saved to {FILTERED_FILE}")

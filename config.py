@@ -10,21 +10,41 @@ BBOX = (39.85, -75.65, 40.35, -74.85)
 BBOX_STR = f"{BBOX[0]},{BBOX[1]},{BBOX[2]},{BBOX[3]}"
 
 # ── Overpass ─────────────────────────────────────────────────────────
+# Primary mirror — tried first.  If it returns a 5xx error the code will
+# automatically fall back through OVERPASS_MIRRORS in order.
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OVERPASS_TIMEOUT = 180
+
+# Fallback mirrors tried in order when the primary returns a 5xx / times out.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
 
 # ── Route filtering ──────────────────────────────────────────────────
 # Route names to exclude from the final map (e.g. state-level connectors
 # that clutter the Circuit Trails view)
-EXCLUDE_ROUTES = {
-    "BicyclePA Route S",
-    "BicyclePA Route L",
-    "BicyclePA Route E",
-}
+EXCLUDE_ROUTES = set()
 
 # ── Trailhead matching ───────────────────────────────────────────────
 # Max distance (degrees) to snap a trailhead label to a graph node (~200m)
 TRAILHEAD_MATCH_DIST = 0.002
+
+# Max distance (degrees) to snap an external trailhead to a route node in
+# osm2loom.py (~100m).  Trailheads within this distance of any route-way node
+# that are not already tagged as route members will be snapped to that node,
+# causing it to become a labelled station on the map.
+TRAILHEAD_SNAP_DIST = 0.001
+
+# Max perpendicular distance (degrees) for inserting a synthetic station node
+# on a route edge in build_map.py (~100m).  Used as a second-pass fallback for
+# trailheads that sit beside a long segment with no nearby OSM node.
+TRAILHEAD_INSERT_DIST = 0.001
+
+# Case-insensitive Overpass regex used to identify trail-access parking lots
+# (amenity=parking nodes/ways whose name matches this pattern).
+TRAIL_PARKING_RE = "trail|greenway"
 
 # ── Rendering ────────────────────────────────────────────────────────
 LINE_WIDTH = 50
