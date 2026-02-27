@@ -502,8 +502,8 @@ def normalize_labels(data: dict) -> dict:
 # Maps (amenity_tag, value) → display emoji
 _AMENITY_ICONS = {
     ("amenity", "bicycle_repair_station"): ("🔧", "repair"),
-    ("information", "map"):                ("🗺️",  "map"),
-    ("amenity", "drinking_water"):         ("💧",  "water"),
+    ("information", "map"):                ("ℹ️",  "map"),
+    ("amenity", "drinking_water"):         ("🚰",  "water"),
     ("amenity", "toilets"):                ("🚻",  "toilets"),
 }
 
@@ -513,8 +513,8 @@ def add_amenities(data: dict) -> dict:
 
     Amenity types queried:
       🔧  amenity=bicycle_repair_station
-      🗺️   tourism=information + information=map
-      💧  amenity=drinking_water
+      ℹ️   tourism=information + information=map
+      🚰  amenity=drinking_water
       🚻  amenity=toilets (public / unspecified access only)
 
     Only snaps to *existing* graph nodes (no edge splitting) within
@@ -566,9 +566,9 @@ out;"""
         if amenity == "bicycle_repair_station":
             icon, icon_type = "🔧", "repair"
         elif tourism == "information" and info == "map":
-            icon, icon_type = "🗺️", "map"
+            icon, icon_type = "ℹ️", "map"
         elif amenity == "drinking_water":
-            icon, icon_type = "💧", "water"
+            icon, icon_type = "🚰", "water"
         elif amenity == "toilets":
             icon, icon_type = "🚻", "toilets"
         else:
