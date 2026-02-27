@@ -26,7 +26,7 @@ build_map.py         ← filters routes, enriches trailhead labels, prunes nodes
 - Trailhead nodes (`highway=trailhead` or `tourism=information` + `information=trailhead`) split their parent ways so they appear as labeled "stations" on the map.
 - Unnamed interior nodes are hidden; only endpoints and labeled trailheads are shown.
 - BicyclePA state routes are excluded by default (they clutter the local Circuit Trails view). Edit `EXCLUDE_ROUTES` in `config.py` to change this.
-- Colors are stripped before rendering so `--random-colors` assigns distinct per-route colors.
+- Routes use their OSM `colour` tag if set; otherwise a deterministic color is derived from the route name.
 
 ---
 
