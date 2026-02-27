@@ -46,6 +46,14 @@ TRAILHEAD_INSERT_DIST = 0.001
 # (amenity=parking nodes/ways whose name matches this pattern).
 TRAIL_PARKING_RE = "trail|greenway"
 
+# ── Amenity icons ─────────────────────────────────────────────────────
+# Max distance (degrees) to snap an amenity POI to an existing graph node (~100m).
+AMENITY_MATCH_DIST = 0.001
+
+# Minimum spacing (degrees) between icons of the same type (~200m).
+# Prevents icon clutter in dense areas (e.g. many water fountains in Fairmount Park).
+AMENITY_MIN_SPACING = 0.002
+
 # ── Rendering ────────────────────────────────────────────────────────
 LINE_WIDTH = 50
 LINE_SPACING = 25
