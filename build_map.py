@@ -27,6 +27,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -167,6 +168,61 @@ def filter_routes(data: dict) -> dict:
     return data
 
 
+# ── Label normalisation helpers ───────────────────────────────────────
+
+# Generic words / phrases that add no useful location information.
+_SUFFIX_RE = re.compile(
+    r"[\s,\-]*\b("
+    r"trailhead|trail\s+head|parking\s+area|parking\s+lot"
+    r"|parking|access\s+point|access\s+area|access"
+    r")\b[\s,\-]*$",
+    re.IGNORECASE,
+)
+# Leftover connector words after route names have been removed.
+_CONNECTOR_RE = re.compile(
+    r"^\s*(\band\b|\bor\b|&|at|near|[-,/])\s*"
+    r"|\s*(\band\b|\bor\b|&|at|near|[-,/])\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_label(name: str, route_names: set) -> str:
+    """Shorten a trailhead / parking label for use as a metro-map station name.
+
+    Steps (in order):
+      1. Strip generic suffixes: "Trailhead", "Parking", "Parking Area", etc.
+      2. Strip substrings that exactly match a known route name — they are
+         redundant because the station already appears on those lines.
+         Route names are stripped longest-first to avoid leaving fragments.
+      3. Clean up leftover connectors ("and", "&", "-", …).
+      4. Fall back to the suffix-stripped version if route stripping leaves
+         less than 3 characters (e.g. "Audubon Loop Trail Trailhead" →
+         suffix-strip → "Audubon Loop Trail" → route-strip → "" → fall back
+         to "Audubon Loop Trail").
+      5. Fall back to the original name if even the suffix-stripped version
+         is empty.
+    """
+    # Step 1 – strip suffix
+    after_suffix = _SUFFIX_RE.sub("", name).strip()
+
+    # Step 2 – strip route names (longest first)
+    after_routes = after_suffix
+    for rname in sorted(route_names, key=len, reverse=True):
+        if len(rname) < 5:
+            continue  # skip very short names to avoid false positives
+        after_routes = re.sub(re.escape(rname), "", after_routes, flags=re.IGNORECASE)
+
+    # Step 3 – clean connectors (repeat a few times to handle chains)
+    for _ in range(3):
+        after_routes = _CONNECTOR_RE.sub("", after_routes).strip(" ,.-&/")
+
+    # Step 4 – fall back to suffix-stripped version if route-stripping went too far
+    result = after_routes if len(after_routes) >= 3 else after_suffix
+
+    # Step 5 – ultimate fallback
+    return result.strip() if len(result.strip()) >= 3 else name
+
+
 # ── Stage 3: Enrich with trailhead labels ────────────────────────────
 
 def _project_onto_segment(
@@ -238,6 +294,15 @@ out center;"""
         return data
 
     # ── Pass 1: label nearest existing graph node ─────────────────────
+    # Process tagged trailheads before parking lots so a parking lot can never
+    # overwrite a proper trailhead label on the same nearby node.
+    def _is_parking(e):
+        return e.get("tags", {}).get("amenity") == "parking"
+    elements = (
+        [e for e in elements if not _is_parking(e)] +
+        [e for e in elements if _is_parking(e)]
+    )
+
     added = 0
     unmatched: list[tuple] = []  # (osm_id, name, lon, lat) — candidates for pass 2
     for elem in elements:
@@ -335,6 +400,41 @@ out center;"""
         if f["geometry"]["type"] == "Point" and f["properties"].get("station_label")
     )
     log("trailheads", f"Total labelled stations: {labeled}")
+    return data
+
+
+# ── Stage 3b: Normalize station labels ───────────────────────────────
+
+def normalize_labels(data: dict) -> dict:
+    """Strip redundant route names and generic suffixes from all station labels.
+
+    Route names are collected from the graph itself so they are always current
+    without any hardcoding.  Normalisation is applied to every labelled Point
+    feature, including labels set by osm2loom's snap pass.
+    """
+    # Collect every route name present in the graph.
+    route_names: set[str] = set()
+    for feat in data["features"]:
+        if feat["geometry"]["type"] == "LineString":
+            for line in feat.get("properties", {}).get("lines", []):
+                label = line.get("label", "").strip()
+                if label:
+                    route_names.add(label)
+
+    normalized = 0
+    for feat in data["features"]:
+        if feat["geometry"]["type"] != "Point":
+            continue
+        props = feat["properties"]
+        old_label = props.get("station_label", "").strip()
+        if not old_label:
+            continue
+        new_label = normalize_label(old_label, route_names)
+        if new_label != old_label:
+            props["station_label"] = new_label
+            normalized += 1
+
+    log("labels", f"Normalized {normalized} station labels")
     return data
 
 
@@ -473,6 +573,7 @@ def main() -> None:
         data = add_trailheads(data)
     else:
         log("trailheads", "Skipped")
+    data = normalize_labels(data)   # strip route names + generic suffixes from all labels
     data = filter_nodes(data)
 
     Path(FILTERED_FILE).write_text(json.dumps(data))
