@@ -663,7 +663,7 @@ def normalize_labels(data: dict) -> dict:
         # explicitly named by an OSM trailhead/parking element, clear it.
         # This removes auto-assigned route names from bare endpoint nodes
         # while preserving official trailhead names that happen to match.
-        elif new_label.lower() in route_names_lower and not props.get("osm_named"):
+        if new_label.lower() in route_names_lower and not props.get("osm_named"):
             new_label = ""
             cleared += 1
         if new_label != old_label:
