@@ -501,7 +501,7 @@ def normalize_labels(data: dict) -> dict:
 
 # Bike-centric icon priority: rider needs first, car access last.
 # All icons appear after the station name.
-_ICON_ORDER = ["🔧️", "🚰️", "🚻️", "ℹ️", "🅿️"]
+_ICON_ORDER = ["🚻️", "🚰️", "🔧️", "ℹ️", "🅿️"]
 
 
 def add_amenities(data: dict) -> dict:
@@ -514,7 +514,7 @@ def add_amenities(data: dict) -> dict:
       ℹ️   tourism=information + information=map
       🅿️  has_parking flag set by add_trailheads (pre-seeded, no Overpass query)
 
-    Icon priority order (bike-centric): 🔧️ 🚰️ 🚻️ ℹ️ 🅿️
+    Icon priority order (bike-centric): 🚻️ 🚰️ 🔧️ ℹ️ 🅿️
     Parking appears last — it's useful context but not the primary concern
     for a cyclist already on the trail.
 
