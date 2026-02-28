@@ -1,5 +1,12 @@
 # config.py — Circuit Trails map pipeline configuration
 # Edit this file to change bbox, rendering options, excluded routes, etc.
+#
+# ── Future icon ideas ────────────────────────────────────────────
+# - Replace the word "Trailhead" in station labels with a 🥾 icon
+#   to save label space (e.g. "Valley Forge Trailhead" → "Valley Forge 🥾")
+# - Strip the word "Parking" from labels that already have the 🅿️ icon
+#   (e.g. "Cynwyd Station Parking 🅿️" → "Cynwyd Station 🅿️")
+# - Add a 🔒 icon for rail stations with bicycle parking on OSM
 
 # ── Bounding box ─────────────────────────────────────────────────────
 # Greater Philadelphia / Circuit Trails region
@@ -60,9 +67,9 @@ AMENITY_MATCH_DIST = 0.001
 AMENITY_MIN_SPACING = 0.002
 
 # ── Rail-trail integration ───────────────────────────────────────
-# Max distance (degrees) to merge a trail node into a nearby rail station (~200m).
+# Max distance (degrees) to merge a trail node into a nearby rail station (~150m).
 # Rail stations take priority when both exist within this distance.
-RAIL_STATION_MERGE_DIST = 0.002
+RAIL_STATION_MERGE_DIST = 0.00135
 
 # Minimum spacing (degrees) between rail stations to prevent collapse (~300m).
 RAIL_NODE_MIN_SPACING = 0.003
