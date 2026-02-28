@@ -512,7 +512,8 @@ def add_amenities(data: dict) -> dict:
       🚰️  amenity=drinking_water
       🚻️  amenity=toilets (public / unspecified access only)
       ℹ️   tourism=information + information=map
-      🅿️  has_parking flag set by add_trailheads (pre-seeded, no Overpass query)
+      🅿️  amenity=parking (name~trail|greenway) — queried as ways with out center;
+           also pre-seeded from has_parking flag set by add_trailheads
 
     Icon priority order (bike-centric): 🚻️ 🚰️ 🔧️ ℹ️ 🅿️
     Parking appears last — it's useful context but not the primary concern
@@ -532,8 +533,10 @@ def add_amenities(data: dict) -> dict:
   node["tourism"="information"]["information"="map"]({south},{west},{north},{east});
   node["amenity"="drinking_water"]({south},{west},{north},{east});
   node["amenity"="toilets"]["access"!="private"]({south},{west},{north},{east});
+  way["amenity"="toilets"]["access"!="private"]({south},{west},{north},{east});
+  way["amenity"="parking"]["name"~"{TRAIL_PARKING_RE}",i]({south},{west},{north},{east});
 );
-out;"""
+out center;"""
 
     log("amenities", "Querying Overpass for amenity POIs (repair, water, restrooms, maps)...")
     try:
@@ -577,6 +580,8 @@ out;"""
             icon, icon_type = "🚰️", "water"
         elif amenity == "toilets":
             icon, icon_type = "🚻️", "toilets"
+        elif amenity == "parking":
+            icon, icon_type = "🅿️", "parking"
         else:
             continue
 
