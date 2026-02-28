@@ -1029,9 +1029,13 @@ out center;"""
 
         # Nearest graph node — parking lots use a larger snap distance because
         # their centroid can be 100–200m from the trail edge.
+        # Trail amenity icons only snap to non-rail nodes; rail stations get
+        # their own icons (🔒 ♿) from the rail-specific query below.
         snap_dist = TRAILHEAD_MATCH_DIST if icon_type == "parking" else AMENITY_MATCH_DIST
         best_dist, best_id = float("inf"), None
         for feat in points:
+            if feat["properties"].get("node_type") == "rail_station":
+                continue  # skip rail — they only get 🔒 and ♿
             nlon, nlat = feat["geometry"]["coordinates"]
             d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
             if d < best_dist:
@@ -1044,6 +1048,8 @@ out center;"""
         if icon_type == "parking":
             best_amenity_dist, best_amenity_id = float("inf"), None
             for feat in points:
+                if feat["properties"].get("node_type") == "rail_station":
+                    continue
                 nid = feat["properties"]["id"]
                 if nid not in node_icons:
                     continue
