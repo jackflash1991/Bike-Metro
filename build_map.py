@@ -38,7 +38,7 @@ from config import (
     BBOX, OVERPASS_URL, OVERPASS_TIMEOUT, OVERPASS_MIRRORS,
     EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST, TRAILHEAD_INSERT_DIST, TRAIL_PARKING_RE,
     AMENITY_MATCH_DIST, AMENITY_MIN_SPACING, ENDPOINT_MERGE_DIST,
-    RAIL_STATION_MERGE_DIST, RAIL_NODE_MIN_SPACING,
+    RAIL_STATION_MERGE_DIST, RAIL_NODE_MIN_SPACING, RAIL_AMENITY_SNAP_DIST,
     LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
     CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
 )
@@ -915,8 +915,9 @@ def merge_nearby_endpoints(data: dict) -> dict:
 # ── Stage 3d: Add amenity icons ──────────────────────────────────────
 
 # Bike-centric icon priority: rider needs first, car access last.
+# Rail-specific icons (♿ 🔒) appear before trail amenity icons.
 # All icons appear after the station name.
-_ICON_ORDER = ["🚻️", "🚰️", "🔧️", "ℹ️", "🅿️"]
+_ICON_ORDER = ["♿", "🔒", "🚻️", "🚰️", "🔧️", "ℹ️", "🅿️"]
 
 
 def add_amenities(data: dict) -> dict:
@@ -930,9 +931,12 @@ def add_amenities(data: dict) -> dict:
       🅿️  amenity=parking (name~trail|greenway) — queried as ways with out center;
            also pre-seeded from has_parking flag set by add_trailheads
 
-    Icon priority order (bike-centric): 🚻️ 🚰️ 🔧️ ℹ️ 🅿️
-    Parking appears last — it's useful context but not the primary concern
-    for a cyclist already on the trail.
+    Rail-station-specific icons (separate query):
+      🔒  amenity=bicycle_parking — snapped to nearest rail station node
+      ♿  wheelchair=yes on railway=station/halt nodes — matched by proximity
+          to rail stations in the graph
+
+    Icon priority order: ♿ 🔒 🚻️ 🚰️ 🔧️ ℹ️ 🅿️
 
     Only snaps to *existing* graph nodes (no edge splitting) within
     AMENITY_MATCH_DIST (~100 m).  A minimum-spacing rule (AMENITY_MIN_SPACING,
@@ -1074,6 +1078,71 @@ out center;"""
         if amenity_name and (best_id not in node_amenity_name or icon_type == "parking"):
             node_amenity_name[best_id] = amenity_name
         snapped += 1
+
+    # ── Rail-station-specific icons (bicycle parking + accessibility) ──
+    # These use a separate query and snap only to rail station nodes.
+    rail_points = [f for f in points if f["properties"].get("node_type") == "rail_station"]
+    if rail_points:
+        rail_query = f"""[out:json][timeout:60];
+(
+  node["amenity"="bicycle_parking"]({south},{west},{north},{east});
+  node["railway"="station"]["wheelchair"]({south},{west},{north},{east});
+  node["railway"="halt"]["wheelchair"]({south},{west},{north},{east});
+);
+out;"""
+        log("amenities", "Querying Overpass for bicycle parking + rail accessibility...")
+        try:
+            rail_elems = overpass_query(rail_query)
+        except Exception as exc:
+            log("amenities", f"Rail amenity Overpass error: {exc} — skipping")
+            rail_elems = []
+
+        bike_parking_snapped = 0
+        accessible_snapped = 0
+        for elem in rail_elems:
+            tags = elem.get("tags", {})
+            lon = elem.get("lon")
+            lat = elem.get("lat")
+            if lon is None or lat is None:
+                continue
+
+            amenity = tags.get("amenity", "")
+            railway = tags.get("railway", "")
+            wheelchair = tags.get("wheelchair", "")
+
+            if amenity == "bicycle_parking":
+                icon, icon_type = "🔒", "bike_parking"
+            elif railway in ("station", "halt") and wheelchair == "yes":
+                icon, icon_type = "♿", "accessible"
+            else:
+                continue
+
+            # Find nearest rail station node.
+            best_dist, best_id = float("inf"), None
+            for feat in rail_points:
+                nlon, nlat = feat["geometry"]["coordinates"]
+                d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
+                if d < best_dist:
+                    best_dist, best_id = d, feat["properties"]["id"]
+
+            if best_dist > RAIL_AMENITY_SNAP_DIST or best_id is None:
+                continue
+
+            dist_m = best_dist * 111000
+            target_label = ""
+            for feat in rail_points:
+                if feat["properties"]["id"] == best_id:
+                    target_label = feat["properties"].get("station_label", "")
+                    break
+            log("amenities:rail", f"  {icon} {icon_type} → {best_id} ({target_label}) — {dist_m:.0f}m")
+
+            node_icons.setdefault(best_id, set()).add(icon)
+            if icon_type == "bike_parking":
+                bike_parking_snapped += 1
+            else:
+                accessible_snapped += 1
+
+        log("amenities", f"Rail icons: {bike_parking_snapped} bicycle parking (🔒), {accessible_snapped} accessible (♿)")
 
     # Apply icons to nodes in defined priority order.
     assembled = 0

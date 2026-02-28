@@ -4,9 +4,11 @@
 # ── Future icon ideas ────────────────────────────────────────────
 # - Replace the word "Trailhead" in station labels with a 🥾 icon
 #   to save label space (e.g. "Valley Forge Trailhead" → "Valley Forge 🥾")
-# - Strip the word "Parking" from labels that already have the 🅿️ icon
+# - Strip the word "Parking" from cycle route labels that already have
+#   the 🅿️ icon (car parking for trailhead access)
 #   (e.g. "Cynwyd Station Parking 🅿️" → "Cynwyd Station 🅿️")
-# - Add a 🔒 icon for rail stations with bicycle parking on OSM
+# - Add a 🔒 icon for bicycle parking (amenity=bicycle_parking) at rail
+#   stations — distinct from 🅿️ which is car parking on cycle routes
 
 # ── Bounding box ─────────────────────────────────────────────────────
 # Greater Philadelphia / Circuit Trails region
@@ -55,8 +57,8 @@ TRAIL_PARKING_RE = "trail|greenway"
 
 # ── Endpoint merging ─────────────────────────────────────────────────
 # Max distance (degrees) to merge a trail endpoint (degree-1 node) into a
-# labelled station on a *different* trail, creating a transfer point (~600m).
-ENDPOINT_MERGE_DIST = 0.006
+# labelled station on a *different* trail, creating a transfer point (~300m).
+ENDPOINT_MERGE_DIST = 0.0027
 
 # ── Amenity icons ─────────────────────────────────────────────────────
 # Max distance (degrees) to snap an amenity POI to an existing graph node (~100m).
@@ -73,6 +75,10 @@ RAIL_STATION_MERGE_DIST = 0.00135
 
 # Minimum spacing (degrees) between rail stations to prevent collapse (~300m).
 RAIL_NODE_MIN_SPACING = 0.003
+
+# Max distance (degrees) to snap bicycle parking / accessibility data to a
+# rail station node (~300m).  Bike racks may be across a parking lot.
+RAIL_AMENITY_SNAP_DIST = 0.0027
 
 # ── Rendering ────────────────────────────────────────────────────────
 LINE_WIDTH = 50
