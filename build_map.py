@@ -563,8 +563,8 @@ out center;"""
     snapped = 0
     for elem in elements:
         tags = elem.get("tags", {})
-        lon = elem.get("lon")
-        lat = elem.get("lat")
+        lon = elem.get("lon") or (elem.get("center") or {}).get("lon")
+        lat = elem.get("lat") or (elem.get("center") or {}).get("lat")
         if lon is None or lat is None:
             continue
 
