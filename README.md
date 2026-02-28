@@ -6,6 +6,20 @@ Built on the [loom](https://github.com/ad-freiburg/loom) transit map rendering t
 
 ---
 
+## Branches: two approaches to rail
+
+This repo contains two approaches to combining bicycle routes with regional rail:
+
+**`main` — Overlay method**
+Rail and trail layers are processed through loom separately and composited at render time. Stations appear on the map but have no topological connection to trail nodes. This keeps the layers visually distinct — useful when you don't want to imply direct trail-to-station access.
+
+**`integrated-rail` — Woven graph method**
+Rail stations are merged into the trail graph as primary anchor nodes (highest priority). Nearby trail nodes are absorbed into rail stations, and trail endpoints connect into transfer points. This makes rail/trail connections explicit in the topology, but some stations may appear better-connected to cycle routes than they physically are.
+
+Choose the branch that fits your use case, or compare outputs from both.
+
+---
+
 ## How it works
 
 ```
@@ -35,15 +49,25 @@ build_map.py         ← filters routes, enriches trailhead labels, prunes nodes
 ### Prerequisites
 
 1. **Python 3.10+** — uses `str | None` union syntax
-2. **loom tools** — `loom`, `topo`, `transitmap` binaries in the repo root (or on `$PATH`)  
+2. **loom tools** — `loom`, `topo`, `transitmap` binaries in the repo root (or on `$PATH`)
    → Download from https://github.com/ad-freiburg/loom/releases
-3. *(Optional)* **SEPTA GTFS** — `google_rail.zip` + `gtfs2graph` binary for rail overlay
+3. *(Optional)* **GTFS data + gtfs2graph** — for rail lines (see below)
+
+### GTFS setup (rail lines)
+
+Rail data comes from GTFS feeds, not OSM. To include SEPTA Regional Rail:
+
+1. Download `gtfs2graph` from the [loom releases](https://github.com/ad-freiburg/loom/releases) page
+2. Download SEPTA's GTFS feed from [SEPTA developers](https://www3.septa.org/developer/) → `google_rail.zip`
+3. Unzip into `google_rail_gtfs/`
+4. *(Optional)* For Amtrak Keystone Corridor: download from [Amtrak GTFS](https://www.amtrak.com/gtfs) → unzip into `keystone_gtfs/`
+5. To combine feeds, merge them into `combined_rail_gtfs/` (copy all `.txt` files, concatenating shared files with headers removed from the second feed)
 
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/circuit-trails.git
-cd circuit-trails
+git clone https://github.com/jackflash1991/Bike-Metro.git
+cd Bike-Metro
 pip install -r requirements.txt   # just flake8 for linting; no runtime deps
 ```
 
@@ -80,6 +104,13 @@ All tunable parameters live in **`config.py`** — edit that file rather than th
 | `LINE_SPACING` | `25` | SVG spacing between parallel lines |
 | `STATION_LABEL_SIZE` | `200` | Trailhead label font size |
 | `LINE_LABEL_SIZE` | `160` | Route name label font size |
+
+*`integrated-rail` branch adds:*
+
+| Setting | Default | Description |
+|---|---|---|
+| `RAIL_STATION_MERGE_DIST` | `0.002` (~200m) | Radius to absorb trail nodes into rail stations |
+| `RAIL_NODE_MIN_SPACING` | `0.003` (~300m) | Minimum spacing between rail stations |
 
 ---
 
