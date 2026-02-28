@@ -37,7 +37,8 @@ from pathlib import Path
 from config import (
     BBOX, OVERPASS_URL, OVERPASS_TIMEOUT, OVERPASS_MIRRORS,
     EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST, TRAILHEAD_INSERT_DIST, TRAIL_PARKING_RE,
-    AMENITY_MATCH_DIST, AMENITY_MIN_SPACING,
+    AMENITY_MATCH_DIST, AMENITY_MIN_SPACING, ENDPOINT_MERGE_DIST,
+    RAIL_STATION_MERGE_DIST, RAIL_NODE_MIN_SPACING,
     LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
     CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
 )
@@ -170,6 +171,189 @@ def filter_routes(data: dict) -> dict:
     return data
 
 
+# ── Node type classification ─────────────────────────────────────
+
+# Priority values — higher number wins conflicts.
+_NODE_PRIORITY = {
+    "rail_station":        100,
+    "named_trailhead":      50,
+    "synthetic_trailhead":  40,
+    "amenity_bearing":      30,
+    "unnamed_endpoint":     20,
+    "unnamed_interior":     10,
+}
+
+
+def _classify_trail_node(props: dict) -> tuple[str, int]:
+    """Return (node_type, priority) for an existing trail Point feature."""
+    if props.get("node_type"):
+        # Already classified (e.g. rail station).
+        ntype = props["node_type"]
+        return ntype, _NODE_PRIORITY.get(ntype, 10)
+    label = props.get("station_label", "").strip()
+    osm_named = props.get("osm_named", False)
+    deg = int(props.get("deg", 2))
+    nid = props.get("id", "")
+
+    if osm_named and label:
+        ntype = "named_trailhead"
+    elif label and nid.startswith("th_"):
+        ntype = "synthetic_trailhead"
+    elif label:
+        ntype = "named_trailhead"
+    elif deg == 1:
+        ntype = "unnamed_endpoint"
+    else:
+        ntype = "unnamed_interior"
+    return ntype, _NODE_PRIORITY[ntype]
+
+
+def _make_rail_id(stop_id: str) -> str:
+    """Prefix GTFS stop_id to avoid collision with numeric OSM node IDs."""
+    return f"rail_{stop_id}"
+
+
+# ── Stage 2b: Merge rail stations into trail graph ───────────────
+
+def merge_rail_into_trails(trails: dict, rail: dict) -> dict:
+    """Integrate rail station nodes into the trail graph as primary anchors.
+
+    1. Prefix all rail IDs to prevent collision with OSM IDs.
+    2. Tag every rail Point with node_type="rail_station", priority=100.
+    3. Classify every existing trail Point by its properties.
+    4. For each rail station, find the nearest trail node within
+       RAIL_STATION_MERGE_DIST.  If found, absorb the trail node: keep
+       the rail station's position and label, re-point all edges touching
+       the trail node to the rail station, and hide the trail node.
+    5. Append all rail features (with updated IDs) into the trail graph.
+    6. Validate edge references.
+
+    Returns a single unified FeatureCollection.
+    """
+    features = trails["features"]
+
+    # ── Step 1 & 2: prefix rail IDs, tag rail nodes ──────────────
+    rail_points: list[dict] = []
+    rail_edges: list[dict] = []
+    for feat in rail["features"]:
+        geom_type = feat["geometry"]["type"]
+        props = feat["properties"]
+        if geom_type == "Point":
+            old_id = props.get("id", props.get("station_id", ""))
+            new_id = _make_rail_id(old_id)
+            props["id"] = new_id
+            if props.get("station_id"):
+                props["station_id"] = new_id
+            props["node_type"] = "rail_station"
+            props["priority"] = _NODE_PRIORITY["rail_station"]
+            rail_points.append(feat)
+        elif geom_type == "LineString":
+            old_from = props.get("from", "")
+            old_to = props.get("to", "")
+            props["from"] = _make_rail_id(old_from)
+            props["to"] = _make_rail_id(old_to)
+            rail_edges.append(feat)
+
+    log("merge_rail", f"Rail input: {len(rail_points)} stations, {len(rail_edges)} edges")
+
+    # ── Step 3: classify trail nodes ─────────────────────────────
+    trail_points: list[dict] = []
+    for feat in features:
+        if feat["geometry"]["type"] == "Point":
+            ntype, pri = _classify_trail_node(feat["properties"])
+            feat["properties"]["node_type"] = ntype
+            feat["properties"]["priority"] = pri
+            trail_points.append(feat)
+
+    # ── Step 4: spatial merge — absorb nearby trail nodes ────────
+    # Build a map of trail-point id → feature for fast lookup.
+    id_to_trail_pt: dict[str, dict] = {
+        f["properties"]["id"]: f for f in trail_points
+    }
+
+    absorbed = 0
+    # Track which trail node IDs got replaced by which rail ID.
+    remap: dict[str, str] = {}
+
+    for rail_feat in rail_points:
+        rlon, rlat = rail_feat["geometry"]["coordinates"]
+
+        best_dist, best_trail_id = float("inf"), None
+        for tp in trail_points:
+            tp_id = tp["properties"]["id"]
+            if tp_id in remap:
+                continue  # already absorbed by another rail station
+            tlon, tlat = tp["geometry"]["coordinates"]
+            d = math.sqrt((rlon - tlon) ** 2 + (rlat - tlat) ** 2)
+            if d < best_dist:
+                best_dist, best_trail_id = d, tp_id
+
+        if best_dist < RAIL_STATION_MERGE_DIST and best_trail_id is not None:
+            remap[best_trail_id] = rail_feat["properties"]["id"]
+            dist_m = best_dist * 111_000
+            trail_label = id_to_trail_pt[best_trail_id]["properties"].get("station_label", "")
+            rail_label = rail_feat["properties"].get("station_label", "")
+            log("merge_rail", f"  Absorb trail node {best_trail_id} ({trail_label}) "
+                f"→ rail {rail_feat['properties']['id']} ({rail_label}) — {dist_m:.0f} m")
+            absorbed += 1
+
+    # Re-point trail edges that reference absorbed nodes.
+    repointed = 0
+    for feat in features:
+        if feat["geometry"]["type"] != "LineString":
+            continue
+        props = feat["properties"]
+        coords = feat["geometry"]["coordinates"]
+        for key, coord_idx in [("from", 0), ("to", -1)]:
+            old_id = props.get(key, "")
+            if old_id in remap:
+                new_id = remap[old_id]
+                props[key] = new_id
+                # Update coordinate to rail station position.
+                rail_pt = next(
+                    (r for r in rail_points if r["properties"]["id"] == new_id), None
+                )
+                if rail_pt:
+                    coords[coord_idx] = list(rail_pt["geometry"]["coordinates"])
+                repointed += 1
+
+    # Hide absorbed trail nodes (zero out their labels so filter_nodes drops them).
+    for old_id in remap:
+        tp = id_to_trail_pt.get(old_id)
+        if tp:
+            tp["properties"].update({
+                "station_id": "", "station_label": "",
+                "deg": "0", "deg_in": "0", "deg_out": "0",
+                "node_type": "absorbed",
+            })
+
+    # ── Step 5: append rail features to the unified graph ────────
+    # Points first (loom convention), then edges.
+    features = rail_points + features + rail_edges
+
+    # ── Step 6: validate edge references ─────────────────────────
+    point_ids = {
+        f["properties"]["id"]
+        for f in features
+        if f["geometry"]["type"] == "Point" and f["properties"].get("id")
+    }
+    orphans = 0
+    for feat in features:
+        if feat["geometry"]["type"] != "LineString":
+            continue
+        for key in ("from", "to"):
+            ref = feat["properties"].get(key, "")
+            if ref and ref not in point_ids:
+                orphans += 1
+    if orphans:
+        log("merge_rail", f"  WARNING: {orphans} edge endpoint(s) reference non-existent nodes")
+
+    log("merge_rail", f"Absorbed {absorbed} trail nodes into rail stations, "
+        f"re-pointed {repointed} edge endpoints")
+
+    return {"type": "FeatureCollection", "features": features}
+
+
 # ── Label normalisation helpers ───────────────────────────────────────
 
 # Generic words / phrases that add no useful location information.
@@ -212,7 +396,16 @@ def normalize_label(name: str, route_names: set) -> str:
     for rname in sorted(route_names, key=len, reverse=True):
         if len(rname) < 5:
             continue  # skip very short names to avoid false positives
-        after_routes = re.sub(r"\b" + re.escape(rname) + r"\b", "", after_routes, flags=re.IGNORECASE)
+        # Only strip if the route name is NOT a substring of a larger word
+        # in the label.  E.g. don't strip "Washington" from "Fort Washington"
+        # if the result would be shorter than 3 chars or a single short word.
+        candidate = re.sub(r"\b" + re.escape(rname) + r"\b", "", after_routes, flags=re.IGNORECASE)
+        candidate_clean = re.sub(r"[\s,.\-&/]+", " ", candidate).strip()
+        # If stripping this route name leaves less than 3 meaningful chars,
+        # skip it — the route name is probably part of a proper noun.
+        if len(candidate_clean) < 3:
+            continue
+        after_routes = candidate
 
     # Step 3 – clean connectors (repeat a few times to handle chains)
     for _ in range(3):
@@ -330,10 +523,15 @@ out center;"""
             props = best_feat["properties"]
             if _is_parking(elem):
                 props["has_parking"] = True
+            # Rail station labels take priority — don't overwrite them.
+            if props.get("node_type") == "rail_station" and props.get("station_label"):
+                continue
             if not props.get("station_label"):
                 props["station_label"] = name
                 props["station_id"] = props["id"]
                 props["osm_named"] = True
+                props["node_type"] = "named_trailhead"
+                props["priority"] = _NODE_PRIORITY["named_trailhead"]
                 added += 1
         else:
             unmatched.append((elem["id"], name, lon, lat, _is_parking(elem)))
@@ -346,6 +544,18 @@ out center;"""
     new_items: list[tuple] = []           # (fi, edge1, edge2, point_feat)
 
     for osm_id, name, lon, lat, is_park in unmatched:
+        # Skip insertion if a rail station is nearby — the rail station serves
+        # as the anchor and we don't need a synthetic trailhead competing with it.
+        rail_nearby = any(
+            math.sqrt((lon - f["geometry"]["coordinates"][0]) ** 2 +
+                       (lat - f["geometry"]["coordinates"][1]) ** 2) < TRAILHEAD_INSERT_DIST
+            for f in data["features"]
+            if f["geometry"]["type"] == "Point"
+            and f["properties"].get("node_type") == "rail_station"
+        )
+        if rail_nearby:
+            continue
+
         result = _nearest_edge(lon, lat, data["features"], TRAILHEAD_INSERT_DIST)
         if result is None:
             continue
@@ -380,6 +590,8 @@ out center;"""
             "station_id": new_id,
             "station_label": name,
             "osm_named": True,
+            "node_type": "synthetic_trailhead",
+            "priority": _NODE_PRIORITY["synthetic_trailhead"],
             "deg": "2",
             "deg_in": "1",
             "deg_out": "1",
@@ -441,12 +653,17 @@ def normalize_labels(data: dict) -> dict:
         old_label = props.get("station_label", "").strip()
         if not old_label:
             continue
+        # Rail station labels come from GTFS — skip normalization entirely.
+        # Route-name stripping can damage proper nouns (e.g. "Fort Washington"
+        # losing "Washington" because a route named "Washington" exists).
+        if props.get("node_type") == "rail_station":
+            continue
         new_label = normalize_label(old_label, route_names)
         # If the final label is just a route name and the node was NOT
         # explicitly named by an OSM trailhead/parking element, clear it.
         # This removes auto-assigned route names from bare endpoint nodes
         # while preserving official trailhead names that happen to match.
-        if new_label.lower() in route_names_lower and not props.get("osm_named"):
+        elif new_label.lower() in route_names_lower and not props.get("osm_named"):
             new_label = ""
             cleared += 1
         if new_label != old_label:
@@ -481,11 +698,18 @@ def normalize_labels(data: dict) -> dict:
             if (lon_i - lon_j) ** 2 + (lat_i - lat_j) ** 2 >= _dedup_dist_sq:
                 continue
             # Same label within ~400 m — drop the less authoritative one.
-            i_named = bool(feat_i["properties"].get("osm_named"))
-            j_named = bool(feat_j["properties"].get("osm_named"))
-            i_deg = int(feat_i["properties"].get("deg", 2))
-            j_deg = int(feat_j["properties"].get("deg", 2))
-            drop_j = (i_named and not j_named) or (i_named == j_named and i_deg <= j_deg)
+            # Use priority first (rail_station=100 > named_trailhead=50 > ...),
+            # then fall back to the original osm_named + degree tiebreaker.
+            i_pri = int(feat_i["properties"].get("priority", 0))
+            j_pri = int(feat_j["properties"].get("priority", 0))
+            if i_pri != j_pri:
+                drop_j = (j_pri < i_pri)
+            else:
+                i_named = bool(feat_i["properties"].get("osm_named"))
+                j_named = bool(feat_j["properties"].get("osm_named"))
+                i_deg = int(feat_i["properties"].get("deg", 2))
+                j_deg = int(feat_j["properties"].get("deg", 2))
+                drop_j = (i_named and not j_named) or (i_named == j_named and i_deg <= j_deg)
             victim = feat_j if drop_j else feat_i
             victim["properties"]["station_label"] = ""
             victim["properties"]["station_id"] = ""
@@ -497,7 +721,198 @@ def normalize_labels(data: dict) -> dict:
     return data
 
 
-# ── Stage 3c: Add amenity icons ──────────────────────────────────────
+# ── Stage 3c: Merge nearby trail endpoints ───────────────────────────
+
+def merge_nearby_endpoints(data: dict) -> dict:
+    """Merge degree-1 trail endpoints into labelled stations on other trails.
+
+    When the terminus of one trail sits within ENDPOINT_MERGE_DIST of a
+    labelled station on a *different* trail, re-point the terminus's edge(s)
+    to the station node.  The station becomes a transfer point where both
+    trails meet (like Norristown, where the Chester Valley Trail ends near
+    the Schuylkill River Trail).
+    """
+    # Index point features by id.
+    id_to_point: dict[str, dict] = {}
+    for feat in data["features"]:
+        if feat["geometry"]["type"] == "Point":
+            id_to_point[feat["properties"]["id"]] = feat
+
+    # Build node → set of line ids from edges.
+    node_lines: dict[str, set[str]] = {}
+    for feat in data["features"]:
+        if feat["geometry"]["type"] != "LineString":
+            continue
+        props = feat["properties"]
+        line_ids = set()
+        for ln in (props.get("lines") or []):
+            lid = ln.get("id", "")
+            if lid:
+                line_ids.add(lid)
+        for key in ("from", "to"):
+            nid = props.get(key, "")
+            if nid:
+                node_lines.setdefault(nid, set()).update(line_ids)
+
+    # Compute degree from edges (number of edge endpoints referencing each node).
+    node_deg: dict[str, int] = {}
+    for feat in data["features"]:
+        if feat["geometry"]["type"] == "LineString":
+            for key in ("from", "to"):
+                nid = feat["properties"].get(key, "")
+                if nid:
+                    node_deg[nid] = node_deg.get(nid, 0) + 1
+
+    # Find degree-1 endpoints.
+    endpoints = [
+        nid for nid, deg in node_deg.items()
+        if deg == 1 and nid in id_to_point
+    ]
+
+    # Candidate targets: labelled stations + rail stations (even unlabeled).
+    labelled = [
+        feat for feat in data["features"]
+        if feat["geometry"]["type"] == "Point"
+        and (feat["properties"].get("station_label", "").strip()
+             or feat["properties"].get("node_type") == "rail_station")
+    ]
+
+    def _repoint(old_id: str, new_id: str, new_coords: list) -> None:
+        """Re-point every edge referencing old_id to new_id."""
+        for feat in data["features"]:
+            if feat["geometry"]["type"] != "LineString":
+                continue
+            props = feat["properties"]
+            coords = feat["geometry"]["coordinates"]
+            if props.get("from") == old_id:
+                props["from"] = new_id
+                coords[0] = list(new_coords)
+            if props.get("to") == old_id:
+                props["to"] = new_id
+                coords[-1] = list(new_coords)
+
+    def _hide(nid: str) -> None:
+        """Zero-out a node so filter_nodes drops it."""
+        feat = id_to_point.get(nid)
+        if feat:
+            feat["properties"].update({
+                "station_id": "", "station_label": "",
+                "deg": "0", "deg_in": "0", "deg_out": "0",
+            })
+
+    def _edge_neighbors(nid: str) -> set[str]:
+        """Return all node IDs directly connected to nid by an edge."""
+        nbrs: set[str] = set()
+        for feat in data["features"]:
+            if feat["geometry"]["type"] != "LineString":
+                continue
+            p = feat["properties"]
+            if p.get("from") == nid and p.get("to"):
+                nbrs.add(p["to"])
+            if p.get("to") == nid and p.get("from"):
+                nbrs.add(p["from"])
+        return nbrs
+
+    # ── Pass 1: merge degree-1 endpoints ──────────────────────────────
+    merged = 0
+    merged_targets: set[str] = set()   # track which stations received merges
+
+    for ep_id in endpoints:
+        ep_feat = id_to_point[ep_id]
+        ep_lon, ep_lat = ep_feat["geometry"]["coordinates"]
+        ep_lines = node_lines.get(ep_id, set())
+
+        # Rail terminus stations should never merge into other rail stations.
+        # They are distinct stops on distinct lines (e.g. CHW vs CHE).
+        if ep_feat["properties"].get("node_type") == "rail_station":
+            continue
+
+        # Find the closest labelled station on a DIFFERENT set of trail lines.
+        # Rail stations are always valid targets (different transport mode).
+        best_dist, best_id = float("inf"), None
+        for target in labelled:
+            t_id = target["properties"]["id"]
+            if t_id == ep_id:
+                continue
+            t_node_type = target["properties"].get("node_type")
+            if t_node_type == "rail_station":
+                pass  # always allow trail→rail merge (different mode)
+            else:
+                t_lines = node_lines.get(t_id, set())
+                # Must share NO lines — otherwise they're on the same trail.
+                if ep_lines & t_lines:
+                    continue
+            t_lon, t_lat = target["geometry"]["coordinates"]
+            d = math.sqrt((ep_lon - t_lon) ** 2 + (ep_lat - t_lat) ** 2)
+            if d < best_dist:
+                best_dist, best_id = d, t_id
+
+        if best_dist > ENDPOINT_MERGE_DIST or best_id is None:
+            continue
+
+        target_feat = id_to_point[best_id]
+        target_label = target_feat["properties"].get("station_label", "")
+        dist_m = best_dist * 111000
+        log("merge", f"Merging endpoint {ep_id} into {best_id} ({target_label}) — {dist_m:.0f} m")
+
+        target_coords = target_feat["geometry"]["coordinates"]
+        _repoint(ep_id, best_id, target_coords)
+        _hide(ep_id)
+        merged_targets.add(best_id)
+        merged += 1
+
+    # ── Pass 2: cascade — absorb intermediate nodes left dangling ─────
+    # After re-pointing degree-1 endpoints, a synthetic trailhead node
+    # (e.g. "Norristown Transit Center", inserted by add_trailheads)
+    # can end up one hop from the target station.  Walk outward from each
+    # merge target and absorb labeled nodes within ENDPOINT_MERGE_DIST
+    # that share no lines with the target (i.e. they belong to the trail
+    # that just merged in).
+    cascaded = 0
+    for t_id in merged_targets:
+        t_feat = id_to_point.get(t_id)
+        if not t_feat:
+            continue
+        t_coords = t_feat["geometry"]["coordinates"]
+        t_lines_orig = node_lines.get(t_id, set())
+
+        # Walk outward up to a few hops.
+        visited: set[str] = {t_id}
+        frontier = _edge_neighbors(t_id) - visited
+        for _ in range(3):           # max 3 hops from target
+            if not frontier:
+                break
+            next_frontier: set[str] = set()
+            for nbr_id in frontier:
+                visited.add(nbr_id)
+                nbr_feat = id_to_point.get(nbr_id)
+                if not nbr_feat:
+                    continue
+                nbr_lon, nbr_lat = nbr_feat["geometry"]["coordinates"]
+                d = math.sqrt((t_coords[0] - nbr_lon) ** 2 +
+                              (t_coords[1] - nbr_lat) ** 2)
+                if d > ENDPOINT_MERGE_DIST:
+                    continue
+                # Must not share any original lines with the target.
+                nbr_lines = node_lines.get(nbr_id, set())
+                if nbr_lines & t_lines_orig:
+                    continue
+                dist_m = d * 111000
+                nbr_label = nbr_feat["properties"].get("station_label", "")
+                log("merge", f"  Cascade: absorbing {nbr_id} ({nbr_label}) into {t_id} — {dist_m:.0f} m")
+                _repoint(nbr_id, t_id, t_coords)
+                _hide(nbr_id)
+                cascaded += 1
+                # Continue walking past this absorbed node.
+                next_frontier |= _edge_neighbors(t_id) - visited
+            frontier = next_frontier
+
+    log("merge", f"Merged {merged} trail endpoints into transfer stations"
+        + (f" (+{cascaded} cascaded)" if cascaded else ""))
+    return data
+
+
+# ── Stage 3d: Add amenity icons ──────────────────────────────────────
 
 # Bike-centric icon priority: rider needs first, car access last.
 # All icons appear after the station name.
@@ -549,8 +964,21 @@ out center;"""
 
     points = [f for f in data["features"] if f["geometry"]["type"] == "Point"]
 
+    # Process parking elements last so that water/toilets/repair/map icons are
+    # already in node_icons when parking runs.  This lets parking prefer nodes
+    # that already carry other amenity icons (so 🅿️ clusters with 🚰️🚻️ on
+    # the same dot rather than landing on a separate nearby orphan node).
+    parking_elems = [e for e in elements if e.get("tags", {}).get("amenity") == "parking"]
+    other_elems   = [e for e in elements if e.get("tags", {}).get("amenity") != "parking"]
+    elements = other_elems + parking_elems
+
     # Collect icons per node id — assembled in _ICON_ORDER at the end.
     node_icons: dict[str, set[str]] = {}
+
+    # Best amenity name per node — used as label fallback for nodes that have
+    # no trailhead name.  Parking names take priority (they're processed last
+    # and are most descriptive for trail users).
+    node_amenity_name: dict[str, str] = {}
 
     # Pre-seed parking from the has_parking flag set by add_trailheads().
     for feat in points:
@@ -586,10 +1014,13 @@ out center;"""
             continue
 
         # Minimum-spacing check
-        if any(
+        spacing_blocked = any(
             math.sqrt((lat - plat) ** 2 + (lon - plon) ** 2) < AMENITY_MIN_SPACING
             for plat, plon in placed.get(icon_type, [])
-        ):
+        )
+        if icon_type == "parking":
+            log("amenities:parking", f"  id={elem.get('id')} center=({lat:.6f},{lon:.6f}) spacing_blocked={spacing_blocked}")
+        if spacing_blocked:
             continue
 
         # Nearest graph node — parking lots use a larger snap distance because
@@ -602,11 +1033,46 @@ out center;"""
             if d < best_dist:
                 best_dist, best_id = d, feat["properties"]["id"]
 
+        # For parking: if another amenity icon (water, toilets, repair, map)
+        # already landed on a nearby node, prefer that node so all icons
+        # cluster on the same visible dot rather than scattering across
+        # several adjacent orphan nodes.
+        if icon_type == "parking":
+            best_amenity_dist, best_amenity_id = float("inf"), None
+            for feat in points:
+                nid = feat["properties"]["id"]
+                if nid not in node_icons:
+                    continue
+                # Only consider nodes whose existing icons are NOT solely 🅿️
+                # (pre-seeded has_parking nodes are fine targets too, but skip
+                # nodes that have only a parking icon already — they offer no
+                # consolidation benefit).
+                if node_icons[nid] == {"🅿️"}:
+                    continue
+                nlon, nlat = feat["geometry"]["coordinates"]
+                d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
+                if d < best_amenity_dist:
+                    best_amenity_dist, best_amenity_id = d, nid
+            if best_amenity_id is not None and best_amenity_dist <= snap_dist:
+                best_dist, best_id = best_amenity_dist, best_amenity_id
+
+        if icon_type == "parking":
+            dist_m = best_dist * 111000
+            log("amenities:parking", f"  → nearest node={best_id} dist={dist_m:.0f}m snap_dist={snap_dist*111000:.0f}m {'✓ SNAP' if best_dist <= snap_dist else '✗ TOO FAR'}")
+
         if best_dist > snap_dist or best_id is None:
             continue
 
         node_icons.setdefault(best_id, set()).add(icon)
         placed.setdefault(icon_type, []).append((lat, lon))
+        # Record the amenity's name for label fallback.  Any non-empty name
+        # is stored; parking names overwrite earlier ones since they tend to
+        # be the most useful trail-facing label (e.g. "Chester Valley Trail
+        # Parking").  Water/repair/etc. names fill in when no parking name
+        # is available.
+        amenity_name = tags.get("name", "").strip()
+        if amenity_name and (best_id not in node_amenity_name or icon_type == "parking"):
+            node_amenity_name[best_id] = amenity_name
         snapped += 1
 
     # Apply icons to nodes in defined priority order.
@@ -621,9 +1087,13 @@ out center;"""
         if not ordered:
             continue
         base = props.get("station_label", "").strip()
-        icon_str = " ".join(ordered)
-        props["station_label"] = (base + " " + icon_str).strip() if base else icon_str
+        # For nodes with no trailhead name, fall back to the nearest amenity's
+        # name (e.g. "Chester Valley Trail Parking") so the dot gets a label.
         if not base:
+            base = node_amenity_name.get(nid, "")
+        icon_str = " ".join(ordered)
+        props["station_label"] = (icon_str + " " + base).strip() if base else icon_str
+        if not props.get("station_label", "").strip():
             props["station_id"] = nid  # make unlabeled node visible to transitmap
         assembled += 1
 
@@ -649,13 +1119,16 @@ def filter_nodes(data: dict) -> dict:
         if feat["geometry"]["type"] != "Point":
             continue
         props = feat["properties"]
+        # Rail stations are never hidden — they're primary anchors.
+        if props.get("node_type") == "rail_station":
+            continue
         label = props.get("station_label", "").strip()
         nid = props.get("id", "")
         if not label and node_deg.get(nid, 0) != 1:
             props.update({"station_id": "", "station_label": "", "deg": "0", "deg_in": "0", "deg_out": "0"})
             hidden += 1
 
-    log("nodes", f"Hidden {hidden} unnamed non-endpoint nodes")
+    log("nodes", f"Hidden {hidden} unnamed non-endpoint nodes (rail stations preserved)")
     return data
 
 
@@ -807,14 +1280,28 @@ def main() -> None:
     print("=" * 60)
     check_binaries(need_rail=not args.no_rail)
 
-    # Trail pipeline
+    # Trail pipeline — fetch and filter
     data = fetch_trails(offline=args.offline)
     data = filter_routes(data)
+
+    # Rail pipeline — process EARLY so rail stations become primary anchors
+    rail = {"type": "FeatureCollection", "features": []}
+    if not args.no_rail:
+        rail = process_rail()
+    else:
+        log("rail", "Skipped (--no-rail)")
+
+    # Merge rail stations into trail graph BEFORE enrichment
+    if rail["features"]:
+        data = merge_rail_into_trails(data, rail)
+
+    # Enrichment pipeline — now runs on unified graph (rail + trails)
     if not args.no_trailheads and not args.offline:
         data = add_trailheads(data)
     else:
         log("trailheads", "Skipped")
     data = normalize_labels(data)   # strip route names + generic suffixes from all labels
+    data = merge_nearby_endpoints(data)  # merge trail termini into nearby transfer stations
     if not args.no_amenities and not args.offline:
         data = add_amenities(data)
     else:
@@ -822,17 +1309,10 @@ def main() -> None:
     data = filter_nodes(data)
 
     Path(FILTERED_FILE).write_text(json.dumps(data))
-    log("trails", f"Filtered trail data saved to {FILTERED_FILE}")
+    log("trails", f"Filtered data (incl. integrated rail) saved to {FILTERED_FILE}")
 
-    # Rail pipeline
-    rail = {"type": "FeatureCollection", "features": []}
-    if not args.no_rail:
-        rail = process_rail()
-    else:
-        log("rail", "Skipped (--no-rail)")
-
-    # Combine and render
-    merge_and_render(data, rail, out_dir)
+    # Render — rail is already integrated into data; pass empty rail dict
+    merge_and_render(data, {"type": "FeatureCollection", "features": []}, out_dir)
 
 
 if __name__ == "__main__":

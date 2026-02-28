@@ -12,8 +12,11 @@ octi
 transitmap
 gtfs2graph
 
-# SEPTA GTFS (large, external data)
+# GTFS feeds (large, external data — see README for sources)
 google_rail.zip
+google_rail_gtfs/
+keystone_gtfs/
+combined_rail_gtfs/
 
 # Python
 __pycache__/
