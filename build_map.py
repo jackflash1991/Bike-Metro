@@ -592,7 +592,9 @@ out center;"""
         ):
             continue
 
-        # Nearest graph node within AMENITY_MATCH_DIST
+        # Nearest graph node — parking lots use a larger snap distance because
+        # their centroid can be 100–200m from the trail edge.
+        snap_dist = TRAILHEAD_MATCH_DIST if icon_type == "parking" else AMENITY_MATCH_DIST
         best_dist, best_id = float("inf"), None
         for feat in points:
             nlon, nlat = feat["geometry"]["coordinates"]
@@ -600,7 +602,7 @@ out center;"""
             if d < best_dist:
                 best_dist, best_id = d, feat["properties"]["id"]
 
-        if best_dist > AMENITY_MATCH_DIST or best_id is None:
+        if best_dist > snap_dist or best_id is None:
             continue
 
         node_icons.setdefault(best_id, set()).add(icon)
