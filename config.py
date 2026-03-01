@@ -69,9 +69,9 @@ AMENITY_MATCH_DIST = 0.001
 AMENITY_MIN_SPACING = 0.002
 
 # ── Rail-trail integration ───────────────────────────────────────
-# Max distance (degrees) to merge a trail node into a nearby rail station (~150m).
+# Max distance (degrees) to merge a trail node into a nearby rail station (~100m).
 # Rail stations take priority when both exist within this distance.
-RAIL_STATION_MERGE_DIST = 0.00135
+RAIL_STATION_MERGE_DIST = 0.0009
 
 # Minimum spacing (degrees) between rail stations to prevent collapse (~300m).
 RAIL_NODE_MIN_SPACING = 0.003
