@@ -567,6 +567,12 @@ out center;"""
         coords = orig["geometry"]["coordinates"]
         props = orig["properties"]
 
+        # Don't split a pure rail spine edge (both endpoints are rail_station nodes).
+        # Trailheads beside a rail right-of-way should not appear on the rail line.
+        if (props.get("from", "").startswith("rail_") and
+                props.get("to", "").startswith("rail_")):
+            continue
+
         # Synthetic node id — deterministic, won't collide with real OSM ids.
         new_id = f"th_{osm_id}"
 
