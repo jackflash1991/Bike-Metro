@@ -904,12 +904,12 @@ def main() -> None:
     # Trail pipeline
     data = fetch_trails(offline=args.offline)
     data = filter_routes(data)
-    if not args.no_trailheads and not args.offline:
+    if not args.no_trailheads:
         data = add_trailheads(data)
     else:
         log("trailheads", "Skipped")
     data = normalize_labels(data)   # strip route names + generic suffixes from all labels
-    if not args.no_amenities and not args.offline:
+    if not args.no_amenities:
         data = add_amenities(data)
     else:
         log("amenities", "Skipped")
