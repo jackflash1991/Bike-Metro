@@ -50,6 +50,11 @@ TRAIL_PARKING_RE = "trail|greenway"
 # Max distance (degrees) to snap an amenity POI to an existing graph node (~100m).
 AMENITY_MATCH_DIST = 0.001
 
+# Max perpendicular distance (degrees) to insert a new node on a route edge
+# for an amenity POI (~150m).  Used as a second-pass fallback when no existing
+# graph node is close enough.
+AMENITY_INSERT_DIST = 0.0015
+
 # Minimum spacing (degrees) between icons of the same type (~200m).
 # Prevents icon clutter in dense areas (e.g. many water fountains in Fairmount Park).
 AMENITY_MIN_SPACING = 0.002

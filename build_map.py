@@ -37,7 +37,7 @@ from pathlib import Path
 from config import (
     BBOX, OVERPASS_URL, OVERPASS_TIMEOUT, OVERPASS_MIRRORS,
     EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST, TRAILHEAD_INSERT_DIST, TRAIL_PARKING_RE,
-    AMENITY_MATCH_DIST, AMENITY_MIN_SPACING,
+    AMENITY_MATCH_DIST, AMENITY_MIN_SPACING, AMENITY_INSERT_DIST,
     LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
     CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
 )
@@ -561,6 +561,7 @@ out center;"""
     placed: dict[str, list[tuple[float, float]]] = {}
 
     snapped = 0
+    unsnapped_amenities: list[tuple] = []
     for elem in elements:
         tags = elem.get("tags", {})
         lon = elem.get("lon") or (elem.get("center") or {}).get("lon")
@@ -603,11 +604,83 @@ out center;"""
                 best_dist, best_id = d, feat["properties"]["id"]
 
         if best_dist > snap_dist or best_id is None:
+            unsnapped_amenities.append((lon, lat, icon, icon_type))
             continue
 
         node_icons.setdefault(best_id, set()).add(icon)
         placed.setdefault(icon_type, []).append((lat, lon))
         snapped += 1
+
+    # ── Pass 2: project unsnapped amenities onto nearest route edge ──
+    edge_inserted = 0
+    split_edge_indices: set[int] = set()
+    new_items: list[tuple] = []
+
+    for lon, lat, icon, icon_type in unsnapped_amenities:
+        # Minimum-spacing check against already-placed icons
+        if any(
+            math.sqrt((lat - plat) ** 2 + (lon - plon) ** 2) < AMENITY_MIN_SPACING
+            for plat, plon in placed.get(icon_type, [])
+        ):
+            continue
+
+        result = _nearest_edge(lon, lat, data["features"], AMENITY_INSERT_DIST)
+        if result is None:
+            continue
+        fi, si, _t, qlon, qlat = result
+        if fi in split_edge_indices:
+            continue  # another amenity already claimed this edge
+
+        orig = data["features"][fi]
+        coords = orig["geometry"]["coordinates"]
+        props = orig["properties"]
+
+        new_id = f"am_{icon_type}_{fi}_{si}"
+
+        first_half = coords[: si + 1] + [[qlon, qlat]]
+        second_half = [[qlon, qlat]] + coords[si + 1 :]
+        if len(first_half) < 2 or len(second_half) < 2:
+            continue
+
+        edge1 = {
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": first_half},
+            "properties": {"from": props["from"], "to": new_id, "lines": props["lines"]},
+        }
+        edge2 = {
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": second_half},
+            "properties": {"from": new_id, "to": props["to"], "lines": props["lines"]},
+        }
+        point = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [qlon, qlat]},
+            "properties": {
+                "id": new_id,
+                "station_id": new_id,
+                "station_label": icon,
+                "deg": "2",
+                "deg_in": "1",
+                "deg_out": "1",
+            },
+        }
+
+        split_edge_indices.add(fi)
+        new_items.append((fi, edge1, edge2, point))
+        node_icons.setdefault(new_id, set()).add(icon)
+        placed.setdefault(icon_type, []).append((lat, lon))
+        edge_inserted += 1
+
+    if new_items:
+        remove = {item[0] for item in new_items}
+        data["features"] = [f for i, f in enumerate(data["features"]) if i not in remove]
+        for _, e1, e2, pt in new_items:
+            data["features"].extend([pt, e1, e2])
+
+    log("amenities", f"Pass 2: inserted {edge_inserted} new amenity stations on edges")
+
+    # Refresh points after edge insertions so new nodes are included.
+    points = [f for f in data["features"] if f["geometry"]["type"] == "Point"]
 
     # Apply icons to nodes in defined priority order.
     assembled = 0
@@ -617,10 +690,13 @@ out center;"""
         if not feat:
             continue
         props = feat["properties"]
-        ordered = [ic for ic in _ICON_ORDER if ic in icons]
+        # Skip icons already present in the label (edge-inserted nodes get
+        # their icon set at creation time).
+        existing_label = props.get("station_label", "").strip()
+        ordered = [ic for ic in _ICON_ORDER if ic in icons and ic not in existing_label]
         if not ordered:
             continue
-        base = props.get("station_label", "").strip()
+        base = existing_label
         icon_str = " ".join(ordered)
         props["station_label"] = (base + " " + icon_str).strip() if base else icon_str
         if not base:
