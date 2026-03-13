@@ -47,6 +47,11 @@ import urllib.parse
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
+# Cosine of the mid-latitude of BBOX — used to scale longitude when
+# computing approximate metric distances from degree coordinates.
+_COS_LAT = math.cos(math.radians((BBOX[0] + BBOX[2]) / 2))
+
+
 def log(tag: str, msg: str) -> None:
     print(f"[{tag}] {msg}", flush=True)
 
@@ -231,22 +236,35 @@ def _project_onto_segment(
     px: float, py: float,
     ax: float, ay: float,
     bx: float, by: float,
+    cos_lat: float = 1.0,
 ) -> tuple[float, float, float, float]:
-    """Return (proj_x, proj_y, t, dist) — nearest point on segment AB to P."""
-    dx, dy = bx - ax, by - ay
+    """Return (proj_x, proj_y, t, dist) — nearest point on segment AB to P.
+
+    When *cos_lat* is supplied (cosine of the local latitude), longitude
+    differences are scaled so the returned distance is an approximate
+    great-circle distance in degrees-equivalent units.  The projection
+    point (proj_x, proj_y) is always in raw lon/lat.
+    """
+    # Scale longitude by cos(lat) so east-west distances are correct.
+    dx, dy = (bx - ax) * cos_lat, by - ay
     seg_len_sq = dx * dx + dy * dy
     if seg_len_sq == 0:
-        return ax, ay, 0.0, math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
-    t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+        d = math.sqrt(((px - ax) * cos_lat) ** 2 + (py - ay) ** 2)
+        return ax, ay, 0.0, d
+    t = (((px - ax) * cos_lat) * dx + (py - ay) * dy) / seg_len_sq
     t = max(0.0, min(1.0, t))
-    qx, qy = ax + t * dx, ay + t * dy
-    return qx, qy, t, math.sqrt((px - qx) ** 2 + (py - qy) ** 2)
+    # Projection point in raw lon/lat (un-scaled)
+    qx = ax + t * (bx - ax)
+    qy = ay + t * (by - ay)
+    d = math.sqrt(((px - qx) * cos_lat) ** 2 + (py - qy) ** 2)
+    return qx, qy, t, d
 
 
 def _nearest_edge(
     lon: float, lat: float,
     features: list,
     max_dist: float,
+    cos_lat: float = 1.0,
 ) -> tuple | None:
     """Find nearest point on any LineString feature within max_dist.
 
@@ -261,7 +279,7 @@ def _nearest_edge(
         for si in range(len(coords) - 1):
             ax, ay = coords[si]
             bx, by = coords[si + 1]
-            qx, qy, t, d = _project_onto_segment(lon, lat, ax, ay, bx, by)
+            qx, qy, t, d = _project_onto_segment(lon, lat, ax, ay, bx, by, cos_lat)
             if d < best_dist:
                 best_dist = d
                 best = (fi, si, t, qx, qy)
@@ -346,7 +364,7 @@ out center;"""
     new_items: list[tuple] = []           # (fi, edge1, edge2, point_feat)
 
     for osm_id, name, lon, lat, is_park in unmatched:
-        result = _nearest_edge(lon, lat, data["features"], TRAILHEAD_INSERT_DIST)
+        result = _nearest_edge(lon, lat, data["features"], TRAILHEAD_INSERT_DIST, _COS_LAT)
         if result is None:
             continue
         fi, si, _t, qlon, qlat = result
@@ -586,9 +604,9 @@ out center;"""
         else:
             continue
 
-        # Minimum-spacing check
+        # Minimum-spacing check (lat-corrected)
         if any(
-            math.sqrt((lat - plat) ** 2 + (lon - plon) ** 2) < AMENITY_MIN_SPACING
+            math.sqrt((lat - plat) ** 2 + ((lon - plon) * _COS_LAT) ** 2) < AMENITY_MIN_SPACING
             for plat, plon in placed.get(icon_type, [])
         ):
             continue
@@ -599,7 +617,7 @@ out center;"""
         best_dist, best_id = float("inf"), None
         for feat in points:
             nlon, nlat = feat["geometry"]["coordinates"]
-            d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
+            d = math.sqrt(((lon - nlon) * _COS_LAT) ** 2 + (lat - nlat) ** 2)
             if d < best_dist:
                 best_dist, best_id = d, feat["properties"]["id"]
 
@@ -617,14 +635,14 @@ out center;"""
     new_items: list[tuple] = []
 
     for lon, lat, icon, icon_type in unsnapped_amenities:
-        # Minimum-spacing check against already-placed icons
+        # Minimum-spacing check against already-placed icons (lat-corrected)
         if any(
-            math.sqrt((lat - plat) ** 2 + (lon - plon) ** 2) < AMENITY_MIN_SPACING
+            math.sqrt((lat - plat) ** 2 + ((lon - plon) * _COS_LAT) ** 2) < AMENITY_MIN_SPACING
             for plat, plon in placed.get(icon_type, [])
         ):
             continue
 
-        result = _nearest_edge(lon, lat, data["features"], AMENITY_INSERT_DIST)
+        result = _nearest_edge(lon, lat, data["features"], AMENITY_INSERT_DIST, _COS_LAT)
         if result is None:
             continue
         fi, si, _t, qlon, qlat = result
