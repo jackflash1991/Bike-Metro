@@ -77,9 +77,11 @@ AMENITY_INSERT_OVERRIDES: dict[str, float] = {
     "parking": 0.005,    # ~500m
 }
 
-# Minimum spacing (degrees) between icons of the same type (~200m).
-# Prevents icon clutter in dense areas (e.g. many water fountains in Fairmount Park).
-AMENITY_MIN_SPACING = 0.002
+# Minimum spacing (degrees) between icons of the same type (~100m).
+# Prevents icon clutter when multiple OSM elements map to the same real-world
+# facility, while still allowing distinct nearby facilities (e.g. two water
+# fountains 148m apart at different Valley Forge picnic areas).
+AMENITY_MIN_SPACING = 0.001
 
 # ── Rendering ────────────────────────────────────────────────────────
 LINE_WIDTH = 50
