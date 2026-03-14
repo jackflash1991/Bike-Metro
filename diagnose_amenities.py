@@ -13,7 +13,8 @@ import urllib.parse
 from config import (
     BBOX, OVERPASS_MIRRORS, OVERPASS_TIMEOUT,
     AMENITY_MATCH_DIST, AMENITY_MIN_SPACING, AMENITY_INSERT_DIST,
-    TRAILHEAD_MATCH_DIST, TRAIL_PARKING_RE,
+    AMENITY_SNAP_OVERRIDES, AMENITY_INSERT_OVERRIDES,
+    TRAIL_PARKING_RE,
 )
 
 # Target amenity OSM IDs to investigate
@@ -131,7 +132,7 @@ for elem in elements:
     )
 
     # Nearest node check
-    snap_dist = TRAILHEAD_MATCH_DIST if icon_type == "parking" else AMENITY_MATCH_DIST
+    snap_dist = AMENITY_SNAP_OVERRIDES.get(icon_type, AMENITY_MATCH_DIST)
     best_dist, best_id = float("inf"), None
     for feat in points:
         nlon, nlat = feat["geometry"]["coordinates"]

@@ -47,8 +47,20 @@ TRAILHEAD_INSERT_DIST = 0.001
 TRAIL_PARKING_RE = "trail|greenway"
 
 # ── Amenity icons ─────────────────────────────────────────────────────
-# Max distance (degrees) to snap an amenity POI to an existing graph node (~100m).
+# Default max distance (degrees) to snap an amenity POI to an existing graph
+# node (~100m).  Used for repair stations and info maps.
 AMENITY_MATCH_DIST = 0.001
+
+# Per-type snap overrides (degrees).  Restrooms and drinking water are critical
+# trail amenities that are often set back 150-300m from the trail centerline
+# (e.g. park restroom buildings, picnic-area fountains in Valley Forge).
+# Parking already used TRAILHEAD_MATCH_DIST; now all three share a generous
+# snap radius (~200m) so they aren't missed.
+AMENITY_SNAP_OVERRIDES: dict[str, float] = {
+    "water": 0.002,      # ~200m — fountains at park facilities
+    "toilets": 0.002,    # ~200m — restroom buildings off-trail
+    "parking": 0.002,    # ~200m — (unchanged, was TRAILHEAD_MATCH_DIST)
+}
 
 # Max perpendicular distance (degrees) to insert a new node on a route edge
 # for an amenity POI (~300m).  Used as a second-pass fallback when no existing
@@ -56,6 +68,14 @@ AMENITY_MATCH_DIST = 0.001
 # (especially restroom buildings and parking lots) can be 200m+ from the
 # trail centerline, and the distance is latitude-corrected.
 AMENITY_INSERT_DIST = 0.003
+
+# Per-type insert overrides (degrees).  Water and toilets get a larger insert
+# radius (~500m) to catch facilities set well back from the trail.
+AMENITY_INSERT_OVERRIDES: dict[str, float] = {
+    "water": 0.005,      # ~500m
+    "toilets": 0.005,    # ~500m
+    "parking": 0.005,    # ~500m
+}
 
 # Minimum spacing (degrees) between icons of the same type (~200m).
 # Prevents icon clutter in dense areas (e.g. many water fountains in Fairmount Park).

@@ -38,6 +38,7 @@ from config import (
     BBOX, OVERPASS_URL, OVERPASS_TIMEOUT, OVERPASS_MIRRORS,
     EXCLUDE_ROUTES, TRAILHEAD_MATCH_DIST, TRAILHEAD_INSERT_DIST, TRAIL_PARKING_RE,
     AMENITY_MATCH_DIST, AMENITY_MIN_SPACING, AMENITY_INSERT_DIST,
+    AMENITY_SNAP_OVERRIDES, AMENITY_INSERT_OVERRIDES,
     LINE_WIDTH, LINE_SPACING, STATION_LABEL_SIZE, LINE_LABEL_SIZE,
     CACHE_FILE, FILTERED_FILE, COMBINED_FILE, OUTPUT_SVG,
 )
@@ -611,9 +612,10 @@ out center;"""
         ):
             continue
 
-        # Nearest graph node — parking lots use a larger snap distance because
-        # their centroid can be 100–200m from the trail edge.
-        snap_dist = TRAILHEAD_MATCH_DIST if icon_type == "parking" else AMENITY_MATCH_DIST
+        # Nearest graph node — critical amenities (water, toilets, parking)
+        # use a larger snap distance because they are often set back 150-300m
+        # from the trail centerline (e.g. park restroom buildings).
+        snap_dist = AMENITY_SNAP_OVERRIDES.get(icon_type, AMENITY_MATCH_DIST)
         best_dist, best_id = float("inf"), None
         for feat in points:
             nlon, nlat = feat["geometry"]["coordinates"]
@@ -642,7 +644,8 @@ out center;"""
         ):
             continue
 
-        result = _nearest_edge(lon, lat, data["features"], AMENITY_INSERT_DIST, _COS_LAT)
+        insert_dist = AMENITY_INSERT_OVERRIDES.get(icon_type, AMENITY_INSERT_DIST)
+        result = _nearest_edge(lon, lat, data["features"], insert_dist, _COS_LAT)
         if result is None:
             continue
         fi, si, _t, qlon, qlat = result
