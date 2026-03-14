@@ -7,51 +7,31 @@ Run after build_map.py has cached circuit_trails.json:
 
 import json
 import math
+import urllib.request
+import urllib.parse
 
-# Target amenities to investigate
-TARGETS = [
-    ("drinking_water node/5589331389", -75.4216525, 40.1098097),
-    ("drinking_water node/11878661783", -75.4233555, 40.1095457),
-    ("toilets way/48612863 (estimate)", -75.4225, 40.1093),  # approx center
-]
+from config import (
+    BBOX, OVERPASS_MIRRORS, OVERPASS_TIMEOUT,
+    AMENITY_MATCH_DIST, AMENITY_MIN_SPACING, AMENITY_INSERT_DIST,
+    TRAILHEAD_MATCH_DIST, TRAIL_PARKING_RE,
+)
 
-# Current thresholds
-AMENITY_MATCH_DIST = 0.001
-AMENITY_INSERT_DIST = 0.0015
-AMENITY_MIN_SPACING = 0.002
-COS_LAT = math.cos(math.radians(40.1))  # longitude scaling at this latitude
+# Target amenity OSM IDs to investigate
+TARGET_IDS = {5589331389, 11878661783}
+TARGET_WAY_IDS = {48612863}
 
-
-def project_onto_segment(px, py, ax, ay, bx, by):
-    dx, dy = bx - ax, by - ay
-    seg_len_sq = dx * dx + dy * dy
-    if seg_len_sq == 0:
-        return ax, ay, 0.0, math.sqrt((px - ax) ** 2 + (py - ay) ** 2)
-    t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
-    t = max(0.0, min(1.0, t))
-    qx, qy = ax + t * dx, ay + t * dy
-    return qx, qy, t, math.sqrt((px - qx) ** 2 + (py - qy) ** 2)
-
-
-def project_scaled(px, py, ax, ay, bx, by):
-    """Same projection but with longitude scaled by cos(lat)."""
-    spx, sax, sbx = px * COS_LAT, ax * COS_LAT, bx * COS_LAT
-    dx, dy = sbx - sax, by - ay
-    seg_len_sq = dx * dx + dy * dy
-    if seg_len_sq == 0:
-        return ax, ay, 0.0, math.sqrt((spx - sax) ** 2 + (py - ay) ** 2)
-    t = ((spx - sax) * dx + (py - ay) * dy) / seg_len_sq
-    t = max(0.0, min(1.0, t))
-    qx_s, qy = sax + t * dx, ay + t * dy
-    qx = qx_s / COS_LAT
-    dist = math.sqrt((spx - qx_s) ** 2 + (py - qy) ** 2)
-    return qx, qy, t, dist
+COS_LAT = math.cos(math.radians((BBOX[0] + BBOX[2]) / 2))
 
 
 def deg_to_meters(deg):
     return deg * 111_000
 
 
+def scaled_dist(lon1, lat1, lon2, lat2):
+    return math.sqrt(((lon1 - lon2) * COS_LAT) ** 2 + (lat1 - lat2) ** 2)
+
+
+# ── Load trail graph ─────────────────────────────────────────────────
 with open("circuit_trails.json") as f:
     data = json.load(f)
 
@@ -62,84 +42,141 @@ points = [f for f in data["features"]
 
 print(f"Loaded {len(edges)} edges, {len(points)} point nodes\n")
 
-# Filter edges near Valley Forge area (lon ~ -75.45 to -75.40, lat ~ 40.09 to 40.12)
-vf_edges = []
-for fi, feat in edges:
-    coords = feat["geometry"]["coordinates"]
-    for c in coords:
-        if -75.45 <= c[0] <= -75.40 and 40.09 <= c[1] <= 40.12:
-            lines = feat["properties"].get("lines", [])
-            labels = [l.get("label", "?") for l in lines]
-            vf_edges.append((fi, feat, labels))
-            break
+# ── Fetch the same amenity elements that build_map.py queries ────────
+south, west, north, east = BBOX
+query = f"""[out:json][timeout:60];
+(
+  node["amenity"="bicycle_repair_station"]({south},{west},{north},{east});
+  node["tourism"="information"]["information"="map"]({south},{west},{north},{east});
+  node["amenity"="drinking_water"]({south},{west},{north},{east});
+  node["amenity"="toilets"]["access"!="private"]({south},{west},{north},{east});
+  way["amenity"="toilets"]["access"!="private"]({south},{west},{north},{east});
+  way["amenity"="parking"]["name"~"{TRAIL_PARKING_RE}",i]({south},{west},{north},{east});
+);
+out center;"""
 
-print(f"Edges near Valley Forge area: {len(vf_edges)}")
-for fi, feat, labels in vf_edges[:15]:
-    coords = feat["geometry"]["coordinates"]
-    print(f"  edge #{fi}: {labels[0] if labels else '?'} ({len(coords)} coords)")
+print("Querying Overpass for amenity elements (same query as build_map.py)...")
+encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
+elements = None
+for mirror in OVERPASS_MIRRORS:
+    try:
+        req = urllib.request.Request(mirror, data=encoded)
+        with urllib.request.urlopen(req, timeout=OVERPASS_TIMEOUT + 30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        elements = result["elements"]
+        print(f"  Got {len(elements)} elements from {mirror}\n")
+        break
+    except Exception as exc:
+        print(f"  {mirror} failed: {exc}")
+if elements is None:
+    print("  ERROR: All mirrors failed. Cannot diagnose.")
+    raise SystemExit(1)
 
-print()
+# ── Find our target amenities in the Overpass results ────────────────
+targets = []
+for elem in elements:
+    eid = elem["id"]
+    etype = elem["type"]
+    if (etype == "node" and eid in TARGET_IDS) or (etype == "way" and eid in TARGET_WAY_IDS):
+        lon = elem.get("lon") or (elem.get("center") or {}).get("lon")
+        lat = elem.get("lat") or (elem.get("center") or {}).get("lat")
+        tags = elem.get("tags", {})
+        amenity = tags.get("amenity", tags.get("tourism", ""))
+        targets.append((f"{etype}/{eid} ({amenity})", lon, lat, elem))
 
-for name, lon, lat in TARGETS:
-    print(f"=== {name} (lon={lon}, lat={lat}) ===")
+if not targets:
+    print("WARNING: None of the target IDs were found in Overpass results!")
+    print("  Check that the IDs are correct and within BBOX.")
+    # Still useful to show what amenities ARE near the area
+else:
+    print(f"Found {len(targets)} target amenities in Overpass results.\n")
 
-    # Nearest graph node
-    best_node_dist, best_node_id, best_node_label = float("inf"), None, ""
+# ── Simulate the snapping pipeline ───────────────────────────────────
+# Reproduce the exact logic from add_amenities() to find WHY each target
+# is skipped.
+
+# First, simulate Pass 1 for ALL amenities to build the `placed` dict
+# (this tells us what icons were placed before our targets are processed).
+placed: dict[str, list[tuple[float, float]]] = {}
+snap_log: list[tuple] = []  # (elem_id, icon_type, snapped_to_node, dist)
+
+for elem in elements:
+    tags = elem.get("tags", {})
+    lon = elem.get("lon") or (elem.get("center") or {}).get("lon")
+    lat = elem.get("lat") or (elem.get("center") or {}).get("lat")
+    if lon is None or lat is None:
+        continue
+
+    amenity = tags.get("amenity", "")
+    tourism = tags.get("tourism", "")
+    info = tags.get("information", "")
+
+    if amenity == "bicycle_repair_station":
+        icon_type = "repair"
+    elif tourism == "information" and info == "map":
+        icon_type = "map"
+    elif amenity == "drinking_water":
+        icon_type = "water"
+    elif amenity == "toilets":
+        icon_type = "toilets"
+    elif amenity == "parking":
+        icon_type = "parking"
+    else:
+        continue
+
+    # Min-spacing check
+    spacing_blocked = any(
+        scaled_dist(lon, lat, plon, plat) < AMENITY_MIN_SPACING
+        for plat, plon in placed.get(icon_type, [])
+    )
+
+    # Nearest node check
+    snap_dist = TRAILHEAD_MATCH_DIST if icon_type == "parking" else AMENITY_MATCH_DIST
+    best_dist, best_id = float("inf"), None
     for feat in points:
         nlon, nlat = feat["geometry"]["coordinates"]
-        d = math.sqrt((lon - nlon) ** 2 + (lat - nlat) ** 2)
-        if d < best_node_dist:
-            best_node_dist = d
-            best_node_id = feat["properties"]["id"]
-            best_node_label = feat["properties"].get("station_label", "")
-    print(f"  Nearest node: {best_node_id} ('{best_node_label}')")
-    print(f"    raw dist: {best_node_dist:.6f} deg (~{deg_to_meters(best_node_dist):.0f}m)")
-    print(f"    Pass 1 AMENITY_MATCH_DIST ({AMENITY_MATCH_DIST}): "
-          f"{'PASS' if best_node_dist <= AMENITY_MATCH_DIST else 'FAIL'}")
+        d = scaled_dist(lon, lat, nlon, nlat)
+        if d < best_dist:
+            best_dist, best_id = d, feat["properties"]["id"]
 
-    # Nearest edge (raw degrees)
-    best_edge_dist = float("inf")
-    best_edge_info = None
-    for fi, feat, labels in edges:
-        coords = feat["geometry"]["coordinates"]
-        for si in range(len(coords) - 1):
-            ax, ay = coords[si]
-            bx, by = coords[si + 1]
-            qx, qy, t, d = project_onto_segment(lon, lat, ax, ay, bx, by)
-            if d < best_edge_dist:
-                best_edge_dist = d
-                route_labels = [l.get("label", "?")
-                                for l in feat["properties"].get("lines", [])]
-                best_edge_info = (fi, si, t, qx, qy, route_labels)
+    snapped = not spacing_blocked and best_dist <= snap_dist and best_id is not None
 
-    if best_edge_info:
-        fi, si, t, qx, qy, route_labels = best_edge_info
-        print(f"  Nearest edge (raw deg): edge #{fi} seg #{si} ({route_labels[0] if route_labels else '?'})")
-        print(f"    raw dist: {best_edge_dist:.6f} deg (~{deg_to_meters(best_edge_dist):.0f}m)")
-        print(f"    Pass 2 AMENITY_INSERT_DIST ({AMENITY_INSERT_DIST}): "
-              f"{'PASS' if best_edge_dist <= AMENITY_INSERT_DIST else 'FAIL'}")
+    eid = elem["id"]
+    is_target = (elem["type"] == "node" and eid in TARGET_IDS) or \
+                (elem["type"] == "way" and eid in TARGET_WAY_IDS)
 
-    # Nearest edge (lat-scaled)
-    best_scaled_dist = float("inf")
-    best_scaled_info = None
-    for fi, feat, labels in edges:
-        coords = feat["geometry"]["coordinates"]
-        for si in range(len(coords) - 1):
-            ax, ay = coords[si]
-            bx, by = coords[si + 1]
-            qx, qy, t, d = project_scaled(lon, lat, ax, ay, bx, by)
-            if d < best_scaled_dist:
-                best_scaled_dist = d
-                route_labels = [l.get("label", "?")
-                                for l in feat["properties"].get("lines", [])]
-                best_scaled_info = (fi, si, t, qx, qy, route_labels)
+    if is_target:
+        print(f"=== {elem['type']}/{eid} ({icon_type}) at lon={lon}, lat={lat} ===")
+        print(f"  Nearest node: {best_id}")
+        print(f"    lat-corrected dist: {best_dist:.6f} deg (~{deg_to_meters(best_dist):.0f}m)")
+        print(f"    snap threshold ({icon_type}): {snap_dist}")
+        print(f"    distance check: {'PASS' if best_dist <= snap_dist else 'FAIL'}")
+        print(f"  Spacing check:")
+        if not placed.get(icon_type):
+            print(f"    No prior {icon_type} icons placed — PASS")
+        else:
+            nearby = []
+            for plat, plon in placed.get(icon_type, []):
+                d = scaled_dist(lon, lat, plon, plat)
+                if d < AMENITY_MIN_SPACING:
+                    nearby.append((d, plat, plon))
+            if nearby:
+                print(f"    BLOCKED by {len(nearby)} nearby {icon_type} icon(s):")
+                for d, plat, plon in sorted(nearby):
+                    print(f"      {d:.6f} deg (~{deg_to_meters(d):.0f}m) at lat={plat:.6f}, lon={plon:.6f}")
+            else:
+                print(f"    No {icon_type} icons within {AMENITY_MIN_SPACING} deg — PASS")
+        print(f"  RESULT: {'SNAPPED' if snapped else 'SKIPPED'}")
+        print()
 
-    if best_scaled_info:
-        fi, si, t, qx, qy, route_labels = best_scaled_info
-        print(f"  Nearest edge (lat-scaled): edge #{fi} seg #{si} ({route_labels[0] if route_labels else '?'})")
-        print(f"    scaled dist: {best_scaled_dist:.6f} deg (~{deg_to_meters(best_scaled_dist):.0f}m)")
+    if snapped:
+        placed.setdefault(icon_type, []).append((lat, lon))
 
-    # What AMENITY_INSERT_DIST would be needed?
-    print(f"  → Need AMENITY_INSERT_DIST >= {best_edge_dist:.6f} (raw) "
-          f"or >= {best_scaled_dist:.6f} (scaled) to catch this amenity")
-    print()
+# ── Show all water/toilet icons placed near Valley Forge ─────────────
+print("--- All water/toilet icons placed near Valley Forge (lat 40.08-40.12) ---")
+for icon_type in ("water", "toilets"):
+    nearby = [(lat, lon) for lat, lon in placed.get(icon_type, [])
+              if 40.08 <= lat <= 40.12 and -75.45 <= lon <= -75.40]
+    print(f"  {icon_type}: {len(nearby)} placed in area")
+    for lat, lon in nearby:
+        print(f"    lat={lat:.6f}, lon={lon:.6f}")
