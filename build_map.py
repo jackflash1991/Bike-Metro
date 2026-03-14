@@ -748,6 +748,16 @@ out center;"""
             props["station_id"] = nid  # make unlabeled node visible to transitmap
         assembled += 1
 
+    # Verify: log any node_icons entries that were NOT applied.
+    not_found = 0
+    for nid in node_icons:
+        feat = id_to_feat.get(nid)
+        if not feat:
+            not_found += 1
+            log("amenities", f"  WARNING: node {nid} has icons but is missing from graph")
+    if not_found:
+        log("amenities", f"  {not_found} node(s) missing — icons lost")
+
     counts = {k: len(v) for k, v in placed.items()}
     log("amenities", f"Snapped {snapped} amenity POIs, applied icons to {assembled} nodes: {counts}")
     return data
@@ -941,6 +951,15 @@ def main() -> None:
     else:
         log("amenities", "Skipped")
     data = filter_nodes(data)
+
+    # Summary: count labeled nodes with icon-only labels (amenity stations).
+    icon_nodes = sum(
+        1 for f in data["features"]
+        if f["geometry"]["type"] == "Point"
+        and f["properties"].get("station_label", "").strip()
+        and any(ic in f["properties"]["station_label"] for ic in ["🚻️", "🚰️", "🔧️", "ℹ️", "🅿️"])
+    )
+    log("verify", f"{icon_nodes} nodes with amenity icons survived filter_nodes")
 
     Path(FILTERED_FILE).write_text(json.dumps(data))
     log("trails", f"Filtered trail data saved to {FILTERED_FILE}")
