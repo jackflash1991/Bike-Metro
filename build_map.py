@@ -632,9 +632,11 @@ out center;"""
         snapped += 1
 
     # ── Pass 2: project unsnapped amenities onto nearest route edge ──
+    # Collect ALL projections first (multiple amenities may land on the same
+    # edge), then split each affected edge at all its projected points at once.
     edge_inserted = 0
-    split_edge_indices: set[int] = set()
-    new_items: list[tuple] = []
+    # edge_splits: fi → [(si, t, qlon, qlat, icon, icon_type), ...]
+    edge_splits: dict[int, list[tuple]] = {}
 
     for lon, lat, icon, icon_type in unsnapped_amenities:
         # Minimum-spacing check against already-placed icons (lat-corrected)
@@ -648,55 +650,77 @@ out center;"""
         result = _nearest_edge(lon, lat, data["features"], insert_dist, _COS_LAT)
         if result is None:
             continue
-        fi, si, _t, qlon, qlat = result
-        if fi in split_edge_indices:
-            continue  # another amenity already claimed this edge
+        fi, si, t, qlon, qlat = result
 
+        edge_splits.setdefault(fi, []).append((si, t, qlon, qlat, icon, icon_type))
+        placed.setdefault(icon_type, []).append((lat, lon))
+        edge_inserted += 1
+
+    # Apply all splits.  For each affected edge, sort split points by their
+    # linear position (segment index, then t within segment) and slice the
+    # original coordinate list into N+1 sub-edges with N new point nodes.
+    remove_indices: set[int] = set()
+    new_features: list[dict] = []
+
+    for fi, splits in edge_splits.items():
         orig = data["features"][fi]
         coords = orig["geometry"]["coordinates"]
         props = orig["properties"]
 
-        new_id = f"am_{icon_type}_{fi}_{si}"
+        # Sort by position along the edge so slicing is ordered.
+        splits.sort(key=lambda s: (s[0], s[1]))
 
-        first_half = coords[: si + 1] + [[qlon, qlat]]
-        second_half = [[qlon, qlat]] + coords[si + 1 :]
-        if len(first_half) < 2 or len(second_half) < 2:
-            continue
+        # Build ordered list of (coord_index_after, [qlon, qlat], new_id, icon, icon_type)
+        cut_points = []
+        for si, _t, qlon, qlat, icon, icon_type in splits:
+            new_id = f"am_{icon_type}_{fi}_{si}"
+            cut_points.append((si + 1, [qlon, qlat], new_id, icon, icon_type))
+            node_icons.setdefault(new_id, set()).add(icon)
 
-        edge1 = {
-            "type": "Feature",
-            "geometry": {"type": "LineString", "coordinates": first_half},
-            "properties": {"from": props["from"], "to": new_id, "lines": props["lines"]},
-        }
-        edge2 = {
-            "type": "Feature",
-            "geometry": {"type": "LineString", "coordinates": second_half},
-            "properties": {"from": new_id, "to": props["to"], "lines": props["lines"]},
-        }
-        point = {
-            "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [qlon, qlat]},
-            "properties": {
-                "id": new_id,
-                "station_id": new_id,
-                "station_label": icon,
-                "deg": "2",
-                "deg_in": "1",
-                "deg_out": "1",
-            },
-        }
+        # Build sub-edges by slicing coords at each cut point.
+        prev_node = props["from"]
+        prev_idx = 0
+        prev_qcoord = None
+        for coord_idx, qcoord, new_id, icon, icon_type in cut_points:
+            # Slice original coords between the previous cut (or start) and this cut.
+            # When two cuts share the same segment, the slice is empty so we
+            # connect directly from the previous cut point.
+            mid = list(coords[prev_idx:coord_idx])
+            if not mid and prev_qcoord is not None:
+                mid = [prev_qcoord]
+            sub_coords = mid + [qcoord]
+            if len(sub_coords) >= 2:
+                new_features.append({
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": sub_coords},
+                    "properties": {"from": prev_node, "to": new_id, "lines": props["lines"]},
+                })
+            new_features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": qcoord},
+                "properties": {
+                    "id": new_id, "station_id": new_id, "station_label": icon,
+                    "deg": "2", "deg_in": "1", "deg_out": "1",
+                },
+            })
+            prev_node = new_id
+            prev_idx = coord_idx
+            prev_qcoord = qcoord
 
-        split_edge_indices.add(fi)
-        new_items.append((fi, edge1, edge2, point))
-        node_icons.setdefault(new_id, set()).add(icon)
-        placed.setdefault(icon_type, []).append((lat, lon))
-        edge_inserted += 1
+        # Final sub-edge from last cut to original "to" node
+        tail_coords = [cut_points[-1][1]] + coords[prev_idx:]
+        if len(tail_coords) >= 2:
+            new_features.append({
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": tail_coords},
+                "properties": {"from": prev_node, "to": props["to"], "lines": props["lines"]},
+            })
 
-    if new_items:
-        remove = {item[0] for item in new_items}
-        data["features"] = [f for i, f in enumerate(data["features"]) if i not in remove]
-        for _, e1, e2, pt in new_items:
-            data["features"].extend([pt, e1, e2])
+        remove_indices.add(fi)
+
+    if new_features:
+        data["features"] = [f for i, f in enumerate(data["features"]) if i not in remove_indices]
+        data["features"].extend(new_features)
 
     log("amenities", f"Pass 2: inserted {edge_inserted} new amenity stations on edges")
 
